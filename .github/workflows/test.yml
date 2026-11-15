@@ -5,8 +5,10 @@ on:
   pull_request:
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # ubuntu-latest is 26.04, which setup-python has no 3.9 build for; 24.04 has both
+    runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         python: ["3.9", "3.13"]
     steps:
