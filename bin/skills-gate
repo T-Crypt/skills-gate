@@ -1,0 +1,1043 @@
+#!/usr/bin/env python3
+"""skills-gate: one global skill in front of every skill on the machine.
+
+Agents see a single always-on skill, `skills-gate`. It carries a short registry (one lane per category, one line
+per skill). Everything else lives in the bank and is pulled in only when a task needs it:
+
+  skills-gate use <skill>            print a skill's playbook into the session (on demand, recorded)
+  skills-gate on <skill> [--global]  link it into this project (or every harness) until it goes stale
+  skills-gate tidy                   the daily pass: collect usage, switch off stale skills, cool unused ones,
+                                     regenerate the registry, re-gate leaks, report context cost
+
+Python 3.9+, standard library only. Home: ~/.skills-gate (override with SKILLS_GATE_HOME).
+Run `skills-gate --help` or `skills-gate <command> --help`.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+VERSION = "0.1.0"
+HOME = Path(os.environ.get("SKILLS_GATE_HOME", Path.home() / ".skills-gate")).expanduser()
+BANK, COLD, GATED = HOME / "bank", HOME / "cold", HOME / "gated"
+DB, CONFIG, LANES_DIR = HOME / "gate.db", HOME / "config.json", HOME / "lanes"
+GATE_DIR = HOME / "skill" / "skills-gate"
+GATE_NAME = "skills-gate"
+DAY = 86400
+
+DEFAULT_CONFIG = {
+    # Global skill folders, one per harness. Only the ones that exist are touched.
+    "harness_dirs": {
+        "claude": "~/.claude/skills",
+        "agents": "~/.agents/skills",        # Pi, HADAL, OpenCode, Codex and others read this one
+        "pi": "~/.pi/agent/skills",
+        "opencode": "~/.config/opencode/skills",
+        "codex": "~/.codex/skills",
+    },
+    # Where `on` links a skill inside a project (relative to the project root).
+    "project_dirs": [".agents/skills", ".claude/skills"],
+    # Skills that stay visible everywhere. The gate itself is always on.
+    "always_on": [],
+    # A skill switched on but unused this many days is switched off.
+    "prune_days": 14,
+    # A bank skill unused this many days (and not pinned) moves to cold storage.
+    "cold_days": 120,
+    # Marketplace sources for `search --market`: "github" (code search for SKILL.md).
+    "marketplace": ["github"],
+    # Claude Code transcripts, scanned by `tidy` for Skill tool calls (structure only, never content).
+    "usage_sources": {"claude": "~/.claude/projects"},
+}
+
+# Lane guesses for skills added without one. Order matters: first match wins.
+LANE_RULES = [
+    ("security", r"\b(security|exploit|bounty|hackerone|reverse|pentest|ctf|malware|re)\b"),
+    ("media", r"(video|motion|caption|film|animation|comfy|image|audio|reel|brand|banner|slideshow|explainer|"
+              r"typography|lower.third|infographic|figma)"),
+    ("web", r"(\bui\b|\bux\b|frontend|react|next\.?js|css|tailwind|design.system|web.?app|typescript|component)"),
+    ("docs", r"(docx|pptx|xlsx|pdf|slides|writing|document|research|report|prose|slop|notes)"),
+    ("principles", r"^principle-"),
+    ("ops", r"(deploy|server|systemd|gpu|engine|model|infra|sync|backup|homelab|cluster|docker)"),
+    ("core", r"(review|debug|bug|test|tdd|spec|ticket|refactor|implement|architect|codebase|verify|plan)"),
+]
+
+
+# ---------------------------------------------------------------------------------------------------- basics
+
+def now() -> int:
+    return int(time.time())
+
+
+def say(*a):
+    print(*a, flush=True)
+
+
+def die(msg: str, code: int = 1):
+    print(f"skills-gate: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def config() -> dict:
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if CONFIG.is_file():
+        user = json.loads(CONFIG.read_text())
+        for k, v in user.items():
+            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                cfg[k].update(v)
+            else:
+                cfg[k] = v
+    return cfg
+
+
+def harness_dirs(cfg: dict) -> dict[str, Path]:
+    out = {}
+    for name, p in cfg["harness_dirs"].items():
+        if not p:
+            continue
+        path = Path(p).expanduser()
+        if path.is_dir():
+            out[name] = path
+    return out
+
+
+def always_on(cfg: dict) -> set[str]:
+    return {GATE_NAME, *cfg.get("always_on", [])}
+
+
+def db() -> sqlite3.Connection:
+    HOME.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    c.executescript("""
+    create table if not exists skills (
+        name text primary key, lane text not null default 'general', description text not null default '',
+        source text not null default '', link integer not null default 0, hash text not null default '',
+        tokens integer not null default 0, pinned integer not null default 0,
+        added_at integer not null, last_used integer, uses integer not null default 0);
+    create table if not exists toggles (
+        skill text not null, scope text not null, path text not null, on_at integer not null,
+        primary key (skill, scope));
+    create table if not exists events (at integer not null, skill text, kind text not null, detail text);
+    create table if not exists meta (key text primary key, value text);
+    """)
+    return c
+
+
+def event(c, skill, kind, detail=""):
+    c.execute("insert into events values (?,?,?,?)", (now(), skill, kind, detail))
+
+
+def meta_get(c, key, default=None):
+    r = c.execute("select value from meta where key=?", (key,)).fetchone()
+    return r[0] if r else default
+
+
+def meta_set(c, key, value):
+    c.execute("insert or replace into meta values (?,?)", (key, str(value)))
+
+
+# ---------------------------------------------------------------------------------------------------- skills
+
+def frontmatter(md: Path) -> dict:
+    """name/description from a SKILL.md front matter, without a YAML dependency (single-line values)."""
+    try:
+        text = md.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    m = re.match(r"^---\s*\n(.*?)\n---", text, re.S)
+    out = {}
+    if m:
+        lines = m.group(1).splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            k, sep, v = line.partition(":")
+            i += 1
+            if not sep or line.startswith((" ", "\t")):
+                continue
+            v = v.strip()
+            if v in (">", ">-", ">+", "|", "|-", "|+"):  # folded or literal block: gather the indented lines
+                block = []
+                while i < len(lines) and (lines[i].startswith((" ", "\t")) or not lines[i].strip()):
+                    block.append(lines[i].strip())
+                    i += 1
+                v = (" " if v.startswith(">") else "\n").join(b for b in block if b)
+            out[k.strip()] = v.strip('"').strip("'")
+    return out
+
+
+def tree_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    for f in sorted(p for p in path.rglob("*") if p.is_file()):
+        h.update(str(f.relative_to(path)).encode())
+        try:
+            h.update(f.read_bytes())
+        except OSError:
+            pass
+    return h.hexdigest()[:16]
+
+
+def est_tokens(md: Path) -> int:
+    try:
+        return max(1, len(md.read_text(encoding="utf-8", errors="replace")) // 4)
+    except OSError:
+        return 0
+
+
+def guess_lane(name: str, desc: str) -> str:
+    text = f"{name} {desc}".lower()
+    for lane, rx in LANE_RULES:
+        if re.search(rx, name.lower() if lane == "principles" else text):
+            return lane
+    return "general"
+
+
+def find_skill_dirs(root: Path, depth: int = 4) -> list[Path]:
+    """Directories holding a SKILL.md under root (root itself included), skipping hidden and vendored folders."""
+    root = root.expanduser()
+    if (root / "SKILL.md").is_file():
+        return [root]
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        rel = Path(dirpath).relative_to(root)
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("node_modules", "__pycache__")]
+        if len(rel.parts) >= depth:
+            dirnames[:] = []
+        if "SKILL.md" in filenames and Path(dirpath) != root:
+            found.append(Path(dirpath))
+            dirnames[:] = []
+    return found
+
+
+def bank_path(name: str) -> Path:
+    return BANK / name
+
+
+def register(c, src: Path, lane: str | None = None, link: bool = False, source: str = "", force: bool = False,
+             name: str | None = None) -> str | None:
+    """Put one skill dir into the bank (copy, or a symlink to its source with link=True) and the registry."""
+    fm = frontmatter(src / "SKILL.md")
+    name = name or fm.get("name") or src.name
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$", name):
+        say(f"[skip]  {src}: unusable skill name {name!r}")
+        return None
+    if name == GATE_NAME:
+        return None
+    dst = bank_path(name)
+    if dst.exists() or dst.is_symlink():
+        if not force:
+            say(f"[have]  {name} (already in the bank; --force replaces it)")
+            return name
+        shutil.rmtree(dst) if dst.is_dir() and not dst.is_symlink() else dst.unlink()
+    BANK.mkdir(parents=True, exist_ok=True)
+    if link:
+        dst.symlink_to(src.resolve())
+    else:
+        shutil.copytree(src, dst, symlinks=False, ignore=shutil.ignore_patterns(".git", "node_modules"))
+    desc = fm.get("description", "")
+    row = c.execute("select lane, pinned, added_at, last_used, uses from skills where name=?", (name,)).fetchone()
+    lane = lane or (row["lane"] if row else None) or guess_lane(name, desc)
+    c.execute("insert or replace into skills (name, lane, description, source, link, hash, tokens, pinned, added_at,"
+              " last_used, uses) values (?,?,?,?,?,?,?,?,?,?,?)",
+              (name, lane, desc, source or str(src), int(link), tree_hash(dst), est_tokens(dst / "SKILL.md"),
+               row["pinned"] if row else 0, row["added_at"] if row else now(), row["last_used"] if row else None,
+               row["uses"] if row else 0))
+    event(c, name, "add", source or str(src))
+    say(f"[add]   {name}  lane={lane}{'  (linked)' if link else ''}")
+    return name
+
+
+def get(c, name: str) -> sqlite3.Row:
+    r = c.execute("select * from skills where name=?", (name,)).fetchone()
+    if not r:
+        hint = c.execute("select name from skills where name like ? limit 5", (f"%{name}%",)).fetchall()
+        die(f"no skill {name!r} in the bank" + (f" (close: {', '.join(x[0] for x in hint)})" if hint else
+                                                  "; try `skills-gate search`"))
+    return r
+
+
+def touch(c, name: str, kind: str = "use", at: int | None = None):
+    c.execute("update skills set last_used=max(coalesce(last_used,0),?), uses=uses+1 where name=?",
+              (at or now(), name))
+    event(c, name, kind)
+
+
+# ---------------------------------------------------------------------------------------------------- linking
+
+def project_root(start: Path | None = None) -> Path:
+    start = (start or Path.cwd()).resolve()
+    try:
+        out = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel"], capture_output=True,
+                             text=True, timeout=10)
+        if out.returncode == 0 and out.stdout.strip():
+            return Path(out.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return start
+
+
+def link_into(target_dir: Path, name: str) -> bool:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    link = target_dir / name
+    src = bank_path(name)
+    if link.is_symlink() and Path(os.readlink(link)) == src:
+        return False
+    if link.exists() and not link.is_symlink():
+        say(f"[keep]  {link} is a real folder, not replaced")
+        return False
+    if link.is_symlink():
+        link.unlink()
+    link.symlink_to(src)
+    return True
+
+
+def unlink_from(target_dir: Path, name: str) -> bool:
+    link = target_dir / name
+    if link.is_symlink() and Path(os.readlink(link)) in (bank_path(name), bank_path(name).resolve()):
+        link.unlink()
+        return True
+    return False
+
+
+def scope_dirs(cfg: dict, scope: str) -> list[Path]:
+    if scope == "global":
+        return list(harness_dirs(cfg).values())
+    root = Path(scope)
+    return [root / d for d in cfg["project_dirs"]]
+
+
+# ---------------------------------------------------------------------------------------------------- the gate skill
+
+GATE_HEAD = """---
+name: skills-gate
+description: "The gate to every skill on this machine. Use when a task needs a capability you do not have loaded, when an instruction names a skill that is not available, or at the start of a project to see which skill lanes exist. One command pulls any skill's playbook in on demand: skills-gate use <name>."
+---
+
+# skills-gate
+
+Only this skill (and a few always-on ones) is loaded. Every other skill waits in the bank, sorted into lanes below.
+Pull in only what the task needs; the rest costs no context.
+
+## Use
+
+```bash
+skills-gate lane <lane>          # the skills in one lane: name, when to use, size
+skills-gate search "<words>"     # search the bank by name, purpose and lane
+skills-gate use <skill>          # print the skill's playbook here and follow it (recorded as used)
+skills-gate on <skill>           # keep it loaded for this project (auto-off after {prune_days} idle days)
+skills-gate off <skill>          # unload it from this project
+skills-gate search "<words>" --market   # find a new skill online; show the user, install only on their yes
+skills-gate add <owner/repo[/path] | git-url | folder>                 # install into the bank (after the yes)
+```
+
+Rules: prefer `use` for a one-off task and `on` for a project that will keep needing it. Never install from the
+market without the user's yes; read the source of anything with few stars. Do not copy bank skills into global
+folders by hand: the daily `tidy` removes anything that bypasses the gate.
+
+## Lanes
+"""
+
+
+def lane_summary(rows) -> str:
+    words = {}
+    for r in rows:
+        for w in re.findall(r"[a-z][a-z-]{3,}", (r["name"] + " " + r["description"]).lower()):
+            if w not in STOP:
+                words[w] = words.get(w, 0) + 1
+    top = sorted(words, key=lambda w: (-words[w], w))[:7]
+    return ", ".join(top)
+
+
+STOP = set("""when with that this from your their into what the for and use used uses using user users skill skills
+task tasks work only also about other than them then each will must should does more most such just like want
+asks need needs make makes made help helps file files code agent agents claude before after over under""".split())
+
+
+def write_registry(c, cfg: dict):
+    """Regenerate the gate skill (lane index) and one file per lane with a line per skill."""
+    rows = c.execute("select * from skills order by lane, name").fetchall()
+    lanes: dict[str, list] = {}
+    for r in rows:
+        lanes.setdefault(r["lane"], []).append(r)
+    LANES_DIR.mkdir(parents=True, exist_ok=True)
+    for f in LANES_DIR.glob("*.md"):
+        if f.stem not in lanes:
+            f.unlink()
+    for lane, rs in lanes.items():
+        lines = [f"# lane: {lane} ({len(rs)} skills)", ""]
+        for r in rs:
+            desc = re.sub(r"\s+", " ", r["description"]).strip()
+            desc = desc[:157] + "..." if len(desc) > 160 else desc
+            lines.append(f"- {r['name']} (~{r['tokens']} tok, used {r['uses']}x): {desc}")
+        (LANES_DIR / f"{lane}.md").write_text("\n".join(lines) + "\n")
+    GATE_DIR.mkdir(parents=True, exist_ok=True)
+    body = [GATE_HEAD.replace("{prune_days}", str(cfg["prune_days"]))]
+    body.append("| lane | skills | about |\n|---|---|---|")
+    for lane, rs in sorted(lanes.items()):
+        body.append(f"| {lane} | {len(rs)} | {lane_summary(rs)} |")
+    hot = c.execute("select name from skills where uses>0 order by last_used desc limit 8").fetchall()
+    if hot:
+        body.append("\nRecently used: " + ", ".join(r[0] for r in hot) + ".")
+    body.append(f"\n{len(rows)} skills in the bank. Registry rebuilt {time.strftime('%Y-%m-%d %H:%M')}.\n")
+    (GATE_DIR / "SKILL.md").write_text("\n".join(body))
+
+
+def install_gate(cfg: dict):
+    for name, d in harness_dirs(cfg).items():
+        link = d / GATE_NAME
+        if link.is_symlink() and Path(os.readlink(link)) == GATE_DIR:
+            continue
+        if link.exists() and not link.is_symlink():
+            say(f"[keep]  {link} is a real folder; remove it to let the gate in")
+            continue
+        if link.is_symlink():
+            link.unlink()
+        link.symlink_to(GATE_DIR)
+        say(f"[gate]  {link}")
+
+
+# ---------------------------------------------------------------------------------------------------- commands
+
+def cmd_init(a):
+    HOME.mkdir(parents=True, exist_ok=True)
+    for d in (BANK, COLD, GATED, LANES_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+    if not CONFIG.exists():
+        CONFIG.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+        say(f"[write] {CONFIG}")
+    cfg = config()
+    c = db()
+    write_registry(c, cfg)
+    install_gate(cfg)
+    c.commit()
+    found = harness_dirs(cfg)
+    say(f"skills-gate {VERSION} ready at {HOME}")
+    say("harness folders: " + (", ".join(f"{k}={v}" for k, v in found.items()) or "none found"))
+    say("next: `skills-gate gate --dry-run` to see what would move behind the gate")
+
+
+def cmd_add(a):
+    c = db()
+    cfg = config()
+    src = a.source
+    added = []
+    if Path(src).expanduser().exists():
+        for d in find_skill_dirs(Path(src)):
+            if a.only and d.name not in a.only and frontmatter(d / "SKILL.md").get("name") not in a.only:
+                continue
+            n = register(c, d, a.lane, link=a.link, force=a.force)
+            if n:
+                added.append(n)
+    else:
+        url, sub, ref = parse_git(src)
+        with tempfile.TemporaryDirectory(prefix="skills-gate-") as td:
+            cmd = ["git", "clone", "-q", "--depth", "1"] + (["--branch", ref] if ref else []) + [url, td + "/r"]
+            if subprocess.run(cmd).returncode != 0:
+                die(f"git clone failed for {url}")
+            root = Path(td) / "r" / sub if sub else Path(td) / "r"
+            if not root.exists():
+                die(f"{sub} not found in {url}")
+            commit = subprocess.run(["git", "-C", td + "/r", "rev-parse", "--short", "HEAD"], capture_output=True,
+                                    text=True).stdout.strip()
+            dirs = find_skill_dirs(root)
+            if not dirs:
+                die(f"no SKILL.md found in {src}")
+            for d in dirs:
+                if a.only and d.name not in a.only and frontmatter(d / "SKILL.md").get("name") not in a.only:
+                    continue
+                rel = d.relative_to(Path(td) / "r")
+                n = register(c, d, a.lane, force=a.force, source=f"{url}#{rel}@{commit}")
+                if n:
+                    added.append(n)
+    write_registry(c, cfg)
+    c.commit()
+    say(f"{len(added)} skill(s) in the bank from {src}")
+
+
+def parse_git(src: str) -> tuple[str, str, str]:
+    """owner/repo[/sub/path][@ref] or a git URL (https://github.com/o/r/tree/<ref>/<sub> understood)."""
+    ref = ""
+    if "@" in src and not src.startswith("git@"):
+        src, ref = src.rsplit("@", 1)
+    m = re.match(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?(?:/tree/([^/]+)(?:/(.*))?)?/?$", src)
+    if m:
+        return f"https://github.com/{m.group(1)}/{m.group(2)}.git", m.group(4) or "", ref or (m.group(3) or "")
+    if re.match(r"^(https?://|git@|ssh://)", src):
+        return src, "", ref
+    parts = src.strip("/").split("/")
+    if len(parts) >= 2 and all(re.match(r"^[A-Za-z0-9._-]+$", p) for p in parts):
+        return f"https://github.com/{parts[0]}/{parts[1]}.git", "/".join(parts[2:]), ref
+    die(f"not a folder, git URL or owner/repo[/path]: {src}")
+
+
+def cmd_adopt(a):
+    """Copy every skill found under the given folders into the bank (symlinked skills stay links to their source)."""
+    c = db()
+    cfg = config()
+    n = 0
+    for root in a.paths:
+        for d in find_skill_dirs(Path(root), depth=2):
+            entry = Path(root).expanduser() / d.name
+            linked = entry.is_symlink()
+            if register(c, d.resolve() if linked else d, a.lane, link=linked and not a.copy, force=a.force):
+                n += 1
+    write_registry(c, cfg)
+    c.commit()
+    say(f"adopted {n} skill(s)")
+
+
+def gated_manifest() -> Path:
+    return GATED / "manifest.json"
+
+
+def cmd_gate(a):
+    """Move every skill out of the harness folders into the bank, leaving only the gate and always-on skills."""
+    cfg = config()
+    c = db()
+    keep = always_on(cfg)
+    man = json.loads(gated_manifest().read_text()) if gated_manifest().exists() else []
+    moved = 0
+    for harness, d in harness_dirs(cfg).items():
+        for entry in sorted(d.iterdir()):
+            name = entry.name
+            if name.startswith(".") or not (entry / "SKILL.md").is_file():
+                continue
+            if name in keep:
+                # always-on: stays where it is, and is shared with every other harness through the bank
+                if not a.dry_run and name != GATE_NAME and not (bank_path(name).exists() or bank_path(name).is_symlink()):
+                    register(c, entry.resolve(), link=True)
+                continue
+            if (entry.is_symlink() and Path(os.readlink(entry)) == bank_path(name)
+                    and c.execute("select 1 from toggles where skill=? and scope='global'", (name,)).fetchone()):
+                continue  # switched on globally through the gate: legitimate
+            if a.dry_run:
+                say(f"[dry]   {harness}: {name}{' (link)' if entry.is_symlink() else ''}")
+                moved += 1
+                continue
+            if not (bank_path(name).exists() or bank_path(name).is_symlink()):
+                linked = entry.is_symlink()
+                register(c, entry.resolve() if linked else entry, link=linked)
+            backup = GATED / harness / name
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            if backup.exists() or backup.is_symlink():
+                shutil.rmtree(backup) if backup.is_dir() and not backup.is_symlink() else backup.unlink()
+            if entry.is_symlink():
+                backup.symlink_to(os.readlink(entry))
+                entry.unlink()
+            else:
+                shutil.move(str(entry), str(backup))
+            c.execute("delete from toggles where skill=? and scope='global'", (name,))
+            man.append({"harness": harness, "dir": str(d), "name": name, "backup": str(backup), "at": now()})
+            event(c, name, "gate", harness)
+            moved += 1
+    if not a.dry_run:
+        for k in keep - {GATE_NAME}:
+            if bank_path(k).exists():
+                for d in harness_dirs(cfg).values():
+                    link_into(d, k)
+        GATED.mkdir(parents=True, exist_ok=True)
+        gated_manifest().write_text(json.dumps(man, indent=1))
+        write_registry(c, cfg)
+        install_gate(cfg)
+        c.commit()
+    say(f"{'would gate' if a.dry_run else 'gated'} {moved} skill entr{'y' if moved == 1 else 'ies'}; "
+        f"always on: {', '.join(sorted(keep))}")
+
+
+def cmd_ungate(a):
+    """Put every gated skill back where it was (the bank keeps its copies)."""
+    c = db()
+    man = json.loads(gated_manifest().read_text()) if gated_manifest().exists() else []
+    left = []
+    for m in man:
+        dst, backup = Path(m["dir"]) / m["name"], Path(m["backup"])
+        if dst.exists() or dst.is_symlink():
+            if dst.is_symlink():
+                dst.unlink()
+            else:
+                left.append(m)
+                say(f"[keep]  {dst} exists; not restored")
+                continue
+        if backup.is_symlink():
+            dst.symlink_to(os.readlink(backup))
+            backup.unlink()
+        elif backup.exists():
+            shutil.move(str(backup), str(dst))
+        else:
+            say(f"[miss]  {backup}")
+            continue
+        event(c, m["name"], "ungate", m["harness"])
+        say(f"[back]  {dst}")
+    gated_manifest().write_text(json.dumps(left, indent=1))
+    if a.remove_gate:
+        for d in harness_dirs(config()).values():
+            g = d / GATE_NAME
+            if g.is_symlink():
+                g.unlink()
+    c.commit()
+
+
+def cmd_lane(a):
+    c = db()
+    if not a.name:
+        for r in c.execute("select lane, count(*) n, sum(tokens) t from skills group by lane order by lane"):
+            say(f"{r['lane']:<14} {r['n']:>4} skills  ~{r['t'] or 0} tok if all loaded")
+        return
+    f = LANES_DIR / f"{a.name}.md"
+    if not f.exists():
+        write_registry(c, config())
+    if not f.exists():
+        die(f"no lane {a.name!r}; lanes: " + ", ".join(sorted(p.stem for p in LANES_DIR.glob('*.md'))))
+    sys.stdout.write(f.read_text())
+
+
+def cmd_set_lane(a):
+    c = db()
+    for n in a.skills:
+        get(c, n)
+        c.execute("update skills set lane=? where name=?", (a.lane, n))
+        say(f"[lane]  {n} -> {a.lane}")
+    write_registry(c, config())
+    c.commit()
+
+
+def score(r, terms) -> int:
+    name, desc, lane = r["name"].lower(), r["description"].lower(), r["lane"].lower()
+    s = 0
+    for t in terms:
+        s += 6 * (t in name) + 3 * (t in lane) + 2 * desc.count(t)
+    return s + min(r["uses"], 5) if s else 0
+
+
+def cmd_search(a):
+    terms = [t for t in re.findall(r"[a-z0-9][a-z0-9+.#-]*", a.query.lower()) if len(t) > 1]
+    if not a.market:
+        c = db()
+        hits = sorted(((score(r, terms), r) for r in c.execute("select * from skills")), key=lambda x: -x[0])
+        hits = [(s, r) for s, r in hits if s > 0][: a.limit]
+        if a.json:
+            say(json.dumps([{"name": r["name"], "lane": r["lane"], "description": r["description"],
+                             "tokens": r["tokens"], "uses": r["uses"]} for _, r in hits], indent=1))
+            return
+        for _, r in hits:
+            say(f"{r['name']:<34} [{r['lane']}] {r['description'][:110]}")
+        if not hits:
+            say("no bank match; try `--market` to search online")
+        return
+    results = market_search(a.query, a.limit)
+    if a.json:
+        say(json.dumps(results, indent=1))
+        return
+    for r in results:
+        say(f"{r['install']:<60} {r['stars']:>6}*  {r['about'][:70]}")
+    if not results:
+        say("no market results")
+    else:
+        say("\ninstall one with: skills-gate add <install>   (only on the user's yes)")
+
+
+def market_search(query: str, limit: int) -> list[dict]:
+    """GitHub code search for SKILL.md files (needs `gh` logged in), falling back to repository search."""
+    out, seen = [], set()
+    if shutil.which("gh"):
+        r = subprocess.run(["gh", "search", "code", query, "--filename", "SKILL.md", "--limit", str(limit * 3),
+                            "--json", "repository,path"], capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            for hit in json.loads(r.stdout or "[]"):
+                repo = hit["repository"]["nameWithOwner"]
+                sub = str(Path(hit["path"]).parent)
+                key = f"{repo}/{sub}" if sub != "." else repo
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({"install": key, "repo": repo, "stars": repo_stars(repo), "about": hit["path"]})
+                if len(out) >= limit:
+                    break
+            terms = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if len(t) > 2]
+            return sorted(out, key=lambda x: (-sum(t in x["install"].lower() for t in terms), -x["stars"]))
+    q = urllib.parse.quote(f"{query} SKILL.md in:readme,description")
+    req = urllib.request.Request(f"https://api.github.com/search/repositories?q={q}&sort=stars&per_page={limit}",
+                                 headers={"Accept": "application/vnd.github+json", "User-Agent": "skills-gate"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            for it in json.load(resp).get("items", []):
+                out.append({"install": it["full_name"], "repo": it["full_name"], "stars": it["stargazers_count"],
+                            "about": (it.get("description") or "")})
+    except OSError as e:
+        say(f"market search failed: {e}")
+    return out
+
+
+_stars: dict[str, int] = {}
+
+
+def repo_stars(repo: str) -> int:
+    if repo not in _stars:
+        r = subprocess.run(["gh", "api", f"repos/{repo}", "--jq", ".stargazers_count"], capture_output=True,
+                           text=True, timeout=20)
+        _stars[repo] = int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else 0
+    return _stars[repo]
+
+
+def cmd_use(a):
+    c = db()
+    r = get(c, a.skill)
+    p = bank_path(r["name"])
+    md = p / "SKILL.md"
+    if not md.is_file():
+        die(f"{md} is missing; `skills-gate doctor` will say why")
+    touch(c, r["name"], "use")
+    c.commit()
+    say(f"<!-- skills-gate use {r['name']} | folder: {p} | lane: {r['lane']} -->")
+    sys.stdout.write(md.read_text(encoding="utf-8", errors="replace"))
+    extra = sorted(str(f.relative_to(p)) for f in p.rglob("*") if f.is_file() and f.name != "SKILL.md")
+    if extra:
+        say(f"\n<!-- files in {p}: {', '.join(extra[:40])}{' ...' if len(extra) > 40 else ''} -->")
+
+
+def cmd_show(a):
+    c = db()
+    r = get(c, a.skill)
+    toggles = c.execute("select scope, on_at from toggles where skill=?", (r["name"],)).fetchall()
+    info = dict(r) | {"path": str(bank_path(r["name"])), "on": [t["scope"] for t in toggles]}
+    if a.json:
+        say(json.dumps(info, indent=1))
+        return
+    for k in ("name", "lane", "description", "source", "path", "tokens", "uses", "pinned", "on"):
+        v = info[k]
+        if k == "pinned":
+            v = "yes" if v else "no"
+        say(f"{k:<12} {v}")
+    say(f"{'last used':<12} {time.strftime('%Y-%m-%d', time.localtime(r['last_used'])) if r['last_used'] else 'never'}")
+
+
+def cmd_on(a):
+    cfg = config()
+    c = db()
+    scope = "global" if a.glob else str(project_root(Path(a.project) if a.project else None))
+    for n in a.skills:
+        r = get(c, n)
+        changed = [d for d in scope_dirs(cfg, scope) if link_into(d, r["name"])]
+        c.execute("insert or replace into toggles values (?,?,?,?)", (r["name"], scope, ";".join(map(str, scope_dirs(
+            cfg, scope))), now()))
+        touch(c, r["name"], "on")
+        say(f"[on]    {r['name']} -> {'every harness' if scope == 'global' else scope}"
+            f"{'' if changed else ' (already linked)'}")
+    c.commit()
+
+
+def cmd_off(a):
+    cfg = config()
+    c = db()
+    scope = "global" if a.glob else str(project_root(Path(a.project) if a.project else None))
+    for n in a.skills:
+        removed = [d for d in scope_dirs(cfg, scope) if unlink_from(d, n)]
+        c.execute("delete from toggles where skill=? and scope=?", (n, scope))
+        event(c, n, "off", scope)
+        say(f"[off]   {n} ({len(removed)} link(s) removed)")
+    c.commit()
+
+
+def cmd_pin(a, value=1):
+    c = db()
+    for n in a.skills:
+        get(c, n)
+        c.execute("update skills set pinned=? where name=?", (value, n))
+        say(f"[{'pin' if value else 'unpin'}]  {n}")
+    c.commit()
+
+
+def cmd_remove(a):
+    c = db()
+    cfg = config()
+    for n in a.skills:
+        get(c, n)
+        remove_skill(c, cfg, n)
+    write_registry(c, cfg)
+    c.commit()
+
+
+def remove_skill(c, cfg, n):
+    if True:
+        for t in c.execute("select scope from toggles where skill=?", (n,)).fetchall():
+            for d in scope_dirs(cfg, t["scope"]):
+                unlink_from(d, n)
+        p = bank_path(n)
+        COLD.mkdir(parents=True, exist_ok=True)
+        dst = COLD / n
+        if dst.exists() or dst.is_symlink():
+            shutil.rmtree(dst) if dst.is_dir() and not dst.is_symlink() else dst.unlink()
+        if p.is_symlink() or p.exists():
+            shutil.move(str(p), str(dst))
+        c.execute("delete from toggles where skill=?", (n,))
+        c.execute("delete from skills where name=?", (n,))
+        event(c, n, "remove", "moved to cold")
+        say(f"[cold]  {n} -> {dst}  (restore: skills-gate add {dst})")
+
+
+def harvest_usage(c, cfg) -> int:
+    """Skill tool calls in Claude Code transcripts since the last harvest. Reads tool names and inputs only."""
+    since = int(meta_get(c, "harvest_at", "0"))
+    names = {r[0] for r in c.execute("select name from skills")}
+    hits = 0
+    root = Path(cfg["usage_sources"].get("claude", "")).expanduser()
+    if root.is_dir():
+        for f in root.rglob("*.jsonl"):
+            try:
+                if f.stat().st_mtime < since:
+                    continue
+                with f.open(encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        if '"Skill"' not in line:
+                            continue
+                        try:
+                            d = json.loads(line)
+                        except ValueError:
+                            continue
+                        for part in (d.get("message") or {}).get("content") or []:
+                            if isinstance(part, dict) and part.get("type") == "tool_use" and part.get("name") == "Skill":
+                                skill = str((part.get("input") or {}).get("skill", "")).split(":")[-1]
+                                ts = d.get("timestamp", "")
+                                at = int(time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))) if ts else now()
+                                if skill in names and at > since:
+                                    touch(c, skill, "seen", at)
+                                    hits += 1
+            except OSError:
+                continue
+    meta_set(c, "harvest_at", now())
+    return hits
+
+
+def visible_cost(cfg) -> dict[str, int]:
+    """Tokens of the skill front matter each harness folder puts in every session (what is always paid)."""
+    out = {}
+    for name, d in harness_dirs(cfg).items():
+        t = 0
+        for e in d.iterdir():
+            md = e / "SKILL.md"
+            if md.is_file():
+                fm = frontmatter(md)
+                t += (len(fm.get("name", "")) + len(fm.get("description", ""))) // 4 + 8
+        out[name] = t
+    return out
+
+
+def cmd_tidy(a):
+    cfg = config()
+    c = db()
+    dry = a.dry_run
+    seen = harvest_usage(c, cfg)
+    say(f"usage: {seen} new Skill call(s) found in transcripts")
+    cutoff = now() - cfg["prune_days"] * DAY
+    for t in c.execute("select t.skill, t.scope, t.on_at, s.last_used, s.pinned from toggles t join skills s"
+                       " on s.name=t.skill").fetchall():
+        last = max(t["on_at"], t["last_used"] or 0)
+        if t["pinned"] or last >= cutoff:
+            continue
+        say(f"[stale] {t['skill']} in {t['scope']} (idle {int((now() - last) / DAY)} d) -> off")
+        if not dry:
+            for d in scope_dirs(cfg, t["scope"]):
+                unlink_from(d, t["skill"])
+            c.execute("delete from toggles where skill=? and scope=?", (t["skill"], t["scope"]))
+            event(c, t["skill"], "prune", t["scope"])
+    cold_cut = now() - cfg["cold_days"] * DAY
+    for r in c.execute("select name, added_at, last_used from skills where pinned=0").fetchall():
+        if r["name"] in always_on(cfg):
+            continue
+        if max(r["added_at"], r["last_used"] or 0) < cold_cut:
+            say(f"[cold]  {r['name']} unused {int((now() - max(r['added_at'], r['last_used'] or 0)) / DAY)} d")
+            if not dry:
+                remove_skill(c, cfg, r["name"])
+    for r in c.execute("select name from skills").fetchall():
+        p = bank_path(r["name"])
+        if not (p / "SKILL.md").is_file():
+            say(f"[broken] {r['name']}: {p} has no SKILL.md (a linked source moved?)")
+    if not dry:
+        reindex(c)
+    keep = always_on(cfg)
+    leaks = [(h, e.name) for h, d in harness_dirs(cfg).items() for e in d.iterdir()
+             if not e.name.startswith(".") and e.name not in keep and (e / "SKILL.md").is_file()
+             and not (e.is_symlink() and Path(os.readlink(e)) == bank_path(e.name)
+                      and c.execute("select 1 from toggles where skill=? and scope='global'", (e.name,)).fetchone())]
+    if leaks:
+        say(f"[leak]  {len(leaks)} skill(s) bypass the gate: " + ", ".join(f"{h}/{n}" for h, n in leaks[:12]))
+        if a.fix and not dry:
+            c.commit()
+            cmd_gate(argparse.Namespace(dry_run=False))
+    if not dry:
+        write_registry(c, cfg)
+        install_gate(cfg)
+        meta_set(c, "tidy_at", now())
+    c.commit()
+    cost = visible_cost(cfg)
+    gate_tok = est_tokens(GATE_DIR / "SKILL.md")
+    bank_bytes = sum(f.stat().st_size for f in BANK.rglob("*") if f.is_file()) if BANK.exists() else 0
+    say("always-loaded skill listing per harness (tokens): " + ", ".join(f"{k} {v}" for k, v in cost.items()))
+    say(f"gate skill body ~{gate_tok} tok; bank {c.execute('select count(*) from skills').fetchone()[0]} skills, "
+        f"{bank_bytes / 1e6:.1f} MB; db {DB.stat().st_size / 1e3:.0f} kB")
+
+
+def reindex(c, relane: bool = False) -> int:
+    """Re-read every bank skill's front matter, size and hash (and re-guess lanes still on 'general')."""
+    n = 0
+    for r in c.execute("select name, lane from skills").fetchall():
+        p = bank_path(r["name"])
+        if not (p / "SKILL.md").is_file():
+            continue
+        desc = frontmatter(p / "SKILL.md").get("description", "")
+        lane = guess_lane(r["name"], desc) if relane and r["lane"] == "general" else r["lane"]
+        c.execute("update skills set description=?, tokens=?, hash=?, lane=? where name=?",
+                  (desc, est_tokens(p / "SKILL.md"), tree_hash(p), lane, r["name"]))
+        n += 1
+    return n
+
+
+def cmd_reindex(a):
+    c = db()
+    n = reindex(c, a.relane)
+    write_registry(c, config())
+    c.commit()
+    say(f"reindexed {n} skill(s)")
+
+
+def cmd_status(a):
+    cfg = config()
+    c = db()
+    n = c.execute("select count(*) from skills").fetchone()[0]
+    used = c.execute("select count(*) from skills where uses>0").fetchone()[0]
+    say(f"skills-gate {VERSION}  home {HOME}")
+    say(f"bank: {n} skills ({used} ever used), cold: {len(list(COLD.glob('*'))) if COLD.exists() else 0}")
+    say(f"always on: {', '.join(sorted(always_on(cfg)))}")
+    for t in c.execute("select skill, scope, on_at from toggles order by scope, skill"):
+        say(f"on: {t['skill']:<30} {t['scope']}")
+    tidy = meta_get(c, "tidy_at")
+    say(f"last tidy: {time.strftime('%Y-%m-%d %H:%M', time.localtime(int(tidy))) if tidy else 'never'}")
+    say("always-loaded listing (tokens): " + ", ".join(f"{k} {v}" for k, v in visible_cost(cfg).items()))
+
+
+def cmd_doctor(a):
+    cfg = config()
+    c = db()
+    bad = 0
+    for name, d in harness_dirs(cfg).items():
+        g = d / GATE_NAME
+        ok = g.is_symlink() and Path(os.readlink(g)) == GATE_DIR
+        bad += not ok
+        say(f"{'ok ' if ok else 'BAD'} gate in {name} ({d})")
+    for r in c.execute("select name from skills"):
+        if not (bank_path(r[0]) / "SKILL.md").is_file():
+            bad += 1
+            say(f"BAD {r[0]}: no SKILL.md in the bank")
+    say("doctor: " + ("all good" if not bad else f"{bad} problem(s)"))
+    raise SystemExit(1 if bad else 0)
+
+
+def cmd_timer(a):
+    """Install the daily tidy as a systemd user timer (Linux), or print a cron line elsewhere."""
+    exe = Path(sys.argv[0]).resolve()
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    if not shutil.which("systemctl"):
+        say(f"no systemd: add this to `crontab -e`:\n17 4 * * * {exe} tidy --fix >> {HOME}/tidy.log 2>&1")
+        return
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    (unit_dir / "skills-gate-tidy.service").write_text(
+        f"[Unit]\nDescription=skills-gate daily tidy\n\n[Service]\nType=oneshot\n"
+        f"ExecStart={sys.executable} {exe} tidy --fix\nNice=10\n")
+    (unit_dir / "skills-gate-tidy.timer").write_text(
+        "[Unit]\nDescription=skills-gate daily tidy\n\n[Timer]\nOnCalendar=*-*-* 04:17\nPersistent=true\n"
+        "RandomizedDelaySec=10min\n\n[Install]\nWantedBy=timers.target\n")
+    subprocess.run(["systemctl", "--user", "daemon-reload"])
+    subprocess.run(["systemctl", "--user", "enable", "--now", "skills-gate-tidy.timer"])
+    say("[timer] skills-gate-tidy.timer enabled (daily 04:17)")
+
+
+# ---------------------------------------------------------------------------------------------------- cli
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="skills-gate", description=__doc__.split("\n")[0])
+    ap.add_argument("--version", action="version", version=VERSION)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    sp.add_parser("init", help="create ~/.skills-gate and put the gate skill in every harness").set_defaults(f=cmd_init)
+    p = sp.add_parser("add", help="install skills into the bank from a folder, git URL or owner/repo[/path][@ref]")
+    p.add_argument("source")
+    p.add_argument("--lane")
+    p.add_argument("--only", nargs="*", help="only these skill names from a multi-skill source")
+    p.add_argument("--link", action="store_true", help="link a local folder instead of copying it")
+    p.add_argument("--force", action="store_true", help="replace a skill already in the bank")
+    p.set_defaults(f=cmd_add)
+    p = sp.add_parser("adopt", help="import every skill found in existing skill folders")
+    p.add_argument("paths", nargs="+")
+    p.add_argument("--lane")
+    p.add_argument("--copy", action="store_true", help="copy symlinked skills instead of keeping the link")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(f=cmd_adopt)
+    p = sp.add_parser("gate", help="move all skills out of the harness folders behind the gate")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(f=cmd_gate)
+    p = sp.add_parser("ungate", help="restore everything `gate` moved")
+    p.add_argument("--remove-gate", action="store_true")
+    p.set_defaults(f=cmd_ungate)
+    p = sp.add_parser("lane", help="list lanes, or the skills in one lane")
+    p.add_argument("name", nargs="?")
+    p.set_defaults(f=cmd_lane)
+    p = sp.add_parser("set-lane", help="move skills to a lane")
+    p.add_argument("lane")
+    p.add_argument("skills", nargs="+")
+    p.set_defaults(f=cmd_set_lane)
+    p = sp.add_parser("search", help="search the bank, or the market with --market")
+    p.add_argument("query")
+    p.add_argument("--market", action="store_true")
+    p.add_argument("--limit", type=int, default=8)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_search)
+    p = sp.add_parser("use", help="print a skill's playbook into the session (on demand)")
+    p.add_argument("skill")
+    p.set_defaults(f=cmd_use)
+    p = sp.add_parser("show", help="registry entry for a skill")
+    p.add_argument("skill")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_show)
+    for name, fn, hlp in (("on", cmd_on, "load skills for this project (or --global)"),
+                          ("off", cmd_off, "unload skills from this project (or --global)")):
+        p = sp.add_parser(name, help=hlp)
+        p.add_argument("skills", nargs="+")
+        p.add_argument("--global", dest="glob", action="store_true")
+        p.add_argument("--project", help="project folder (default: the git root of the current folder)")
+        p.set_defaults(f=fn)
+    p = sp.add_parser("pin", help="never prune these skills")
+    p.add_argument("skills", nargs="+")
+    p.set_defaults(f=lambda a: cmd_pin(a, 1))
+    p = sp.add_parser("unpin", help="let these skills be pruned again")
+    p.add_argument("skills", nargs="+")
+    p.set_defaults(f=lambda a: cmd_pin(a, 0))
+    p = sp.add_parser("remove", help="move skills from the bank to cold storage")
+    p.add_argument("skills", nargs="+")
+    p.set_defaults(f=cmd_remove)
+    p = sp.add_parser("tidy", help="daily pass: usage, stale toggles off, cold storage, registry, leaks, cost")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--fix", action="store_true", help="re-gate skills that bypassed the gate")
+    p.set_defaults(f=cmd_tidy)
+    p = sp.add_parser("reindex", help="re-read every bank skill (description, size, hash)")
+    p.add_argument("--relane", action="store_true", help="re-guess lanes for skills still in 'general'")
+    p.set_defaults(f=cmd_reindex)
+    sp.add_parser("status", help="what is on, where, and what it costs").set_defaults(f=cmd_status)
+    sp.add_parser("doctor", help="check the gate links and the bank").set_defaults(f=cmd_doctor)
+    sp.add_parser("timer", help="install the daily tidy (systemd user timer or a cron line)").set_defaults(f=cmd_timer)
+    a = ap.parse_args(argv)
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()
