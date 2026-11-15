@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -36,7 +37,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 HOME = Path(os.environ.get("SKILLS_GATE_HOME", Path.home() / ".skills-gate")).expanduser()
 BANK, COLD, GATED = HOME / "bank", HOME / "cold", HOME / "gated"
 DB, CONFIG, LANES_DIR = HOME / "gate.db", HOME / "config.json", HOME / "lanes"
@@ -1041,7 +1042,8 @@ def run_reviewer(cfg, path: Path, name: str) -> dict:
     return out
 
 
-def vet(c, cfg, path: Path, name: str, *, allow_risky=False, allow_net=False, review=True, quiet=False) -> dict:
+def vet(c, cfg, path: Path, name: str, *, allow_risky=False, allow_net=False, review=True, quiet=False,
+        egress_gate=True) -> dict:
     """The gate every new or changed skill passes: install scan, egress against approvals, the reviewer.
     Returns a report with ok=True only when nothing blocks it."""
     findings = scan_tree(path)
@@ -1054,7 +1056,7 @@ def vet(c, cfg, path: Path, name: str, *, allow_risky=False, allow_net=False, re
     blocks = []
     if level == "high" and not allow_risky:
         blocks.append("high-risk scan findings (--allow-risky after reading them)")
-    policy = cfg["trust"].get("egress", "deny")
+    policy = cfg["trust"].get("egress", "deny") if egress_gate else "allow"
     if need and policy == "deny":
         blocks.append(f"calls out to unapproved hosts: {', '.join(need)} (--allow-net, or `skills-gate net allow`)")
     if eg["telemetry"] and policy != "allow" and not host_ok("?", net_approved(c, cfg, name)) and not allow_net:
@@ -2470,11 +2472,14 @@ def cmd_tidy(a):
             c.execute("delete from toggles where skill=? and scope=?", (t["skill"], t["scope"]))
             event(c, t["skill"], "prune", t["scope"])
     cold_cut = now() - cfg["cold_days"] * DAY
+    # with peers, a skill is cold only when no machine used it, holds it or pinned it, so every peer agrees
+    peer_last, peer_held, peer_pinned = fleet(c)
     for r in c.execute("select name, added_at, last_used from skills where pinned=0").fetchall():
-        if r["name"] in always_on(cfg) or r["name"] in held:
+        if r["name"] in always_on(cfg) or r["name"] in held or r["name"] in peer_held | peer_pinned:
             continue
-        if max(r["added_at"], r["last_used"] or 0) < cold_cut:
-            say(f"[cold]  {r['name']} unused {int((now() - max(r['added_at'], r['last_used'] or 0)) / DAY)} d")
+        last = max(r["added_at"], r["last_used"] or 0, peer_last.get(r["name"], 0))
+        if last < cold_cut:
+            say(f"[cold]  {r['name']} unused {int((now() - last) / DAY)} d")
             if not dry:
                 remove_skill(c, cfg, r["name"])
     for r in c.execute("select name from skills").fetchall():
@@ -2624,7 +2629,9 @@ def cmd_status(a):
         say(f"on: {t['skill']:<30} {t['scope']}")
     tidy = meta_get(c, "tidy_at")
     say(f"last tidy: {time.strftime('%Y-%m-%d %H:%M', time.localtime(int(tidy))) if tidy else 'never'}")
-    say(f"remote: {meta_get(c, 'remote') or 'none'}")
+    peers = json.loads(meta_get(c, "peers") or "{}")
+    say(f"remote: {meta_get(c, 'remote') or 'none'}" + (f"  (peer {peer_name(cfg)}; also on the bank: "
+        f"{', '.join(sorted(peers))})" if peers else ""))
     say("always-loaded listing (tokens): " + ", ".join(f"{k} {v}" for k, v in visible_cost(cfg).items()))
 
 
@@ -2662,18 +2669,32 @@ def cmd_timer(a):
         return
     unit_dir.mkdir(parents=True, exist_ok=True)
     c = db()
-    push = f"ExecStart=-{sys.executable} {exe} push\n" if meta_get(c, "remote") else ""
+    synced = bool(meta_get(c, "remote"))
+    # with a remote: pull first so the tidy decides with the whole fleet's usage and holds, push after
+    pull = f"ExecStart=-{sys.executable} {exe} pull\n" if synced else ""
+    push = f"ExecStart=-{sys.executable} {exe} push\n" if synced else ""
     (unit_dir / "skills-gate-tidy.service").write_text(
-        f"[Unit]\nDescription=skills-gate daily tidy\n\n[Service]\nType=oneshot\n"
+        f"[Unit]\nDescription=skills-gate daily tidy\n\n[Service]\nType=oneshot\n{pull}"
         f"ExecStart={sys.executable} {exe} tidy --fix\n"
         f"ExecStart=-{sys.executable} {exe} market refresh\n{push}Nice=10\n")
     (unit_dir / "skills-gate-tidy.timer").write_text(
         "[Unit]\nDescription=skills-gate daily tidy\n\n[Timer]\nOnCalendar=*-*-* 04:17\nPersistent=true\n"
         "RandomizedDelaySec=10min\n\n[Install]\nWantedBy=timers.target\n")
+    units = ["skills-gate-tidy.timer"]
+    if synced:  # peers stay in step through the day; a push with nothing new makes no commit
+        (unit_dir / "skills-gate-sync.service").write_text(
+            f"[Unit]\nDescription=skills-gate peer sync\nAfter=network-online.target\n\n[Service]\nType=oneshot\n"
+            f"ExecStart={sys.executable} {exe} push\nNice=10\n")
+        (unit_dir / "skills-gate-sync.timer").write_text(
+            "[Unit]\nDescription=skills-gate peer sync\n\n[Timer]\nOnCalendar=hourly\nPersistent=true\n"
+            "RandomizedDelaySec=5min\n\n[Install]\nWantedBy=timers.target\n")
+        units.append("skills-gate-sync.timer")
     subprocess.run(["systemctl", "--user", "daemon-reload"])
-    subprocess.run(["systemctl", "--user", "enable", "--now", "skills-gate-tidy.timer"])
-    say("[timer] skills-gate-tidy.timer enabled (daily 04:17: tidy, the market catalog refresh"
-        + (", then push to the sync remote)" if push else "); set a remote and rerun to sync nightly"))
+    for u in units:
+        subprocess.run(["systemctl", "--user", "enable", "--now", u])
+    say("[timer] skills-gate-tidy.timer enabled (daily 04:17: "
+        + ("pull, tidy, the market catalog refresh, push); skills-gate-sync.timer enabled (hourly push)" if synced
+           else "tidy, the market catalog refresh); set a remote and rerun to sync with your other machines"))
 
 
 # ---------------------------------------------------------------------------------------------------- scan / audit
@@ -2909,19 +2930,151 @@ def sync_fetch(c) -> dict:
     return json.loads(reg.read_text()) if reg.is_file() else {"skills": {}, "presets": {}}
 
 
+# Settings every peer shares. Paths (harness_dirs, usage_sources, ref_roots, project_dirs) stay per machine.
+SHARED_CONFIG = ("always_on", "prune_days", "cold_days", "marketplace", "market_ttl_hours", "market", "trust",
+                 "suggest", "ignore_agents")
+
+
+def peer_name(cfg: dict | None = None) -> str:
+    return (cfg or config()).get("peer_name") or socket.gethostname().split(".")[0] or "peer"
+
+
+def shared_get(c, ns: str) -> dict:
+    """This machine's current value of one shared namespace, in the registry's shape."""
+    if ns == "config":
+        cfg = config()
+        return {k: cfg[k] for k in SHARED_CONFIG if k in cfg}
+    if ns == "net_allow":
+        out = {}
+        for r in c.execute("select skill, host from net_allow where by != 'global' order by skill, host"):
+            out.setdefault(r[0], []).append(r[1])
+        return out
+    if ns == "presets":
+        return {r[0]: sorted(r[1].split("\n")) for r in
+                c.execute("select name, group_concat(skill, '\n') from presets group by name")}
+    if ns == "attrs":
+        return {r[0]: {"lane": r[1], "pinned": r[2]} for r in c.execute("select name, lane, pinned from skills")}
+    raise KeyError(ns)
+
+
+def shared_set(c, ns: str, key: str, value):
+    if ns == "config":
+        def put(u):
+            if value is None:
+                u.pop(key, None)
+            else:
+                u[key] = value
+        edit_config(put)
+    elif ns == "net_allow":
+        want = set(value or [])
+        have = {r[0] for r in c.execute("select host from net_allow where skill=? and by != 'global'", (key,))}
+        for h in have - want:
+            c.execute("delete from net_allow where skill=? and host=?", (key, h))
+            event(c, key, "net-revoke", f"{h} (sync)")
+        c.executemany("insert or ignore into net_allow values (?,?,?,?)",
+                      [(key, h, now(), "sync") for h in sorted(want - have)])
+    elif ns == "presets":
+        c.execute("delete from presets where name=?", (key,))
+        c.executemany("insert or ignore into presets values (?,?)",
+                      [(key, s) for s in value or [] if in_bank(s)])
+    elif ns == "attrs" and value is not None:
+        c.execute("update skills set lane=?, pinned=? where name=?", (value["lane"], value["pinned"], key))
+
+
+def sync_shared(c, reg: dict, spaces=("config", "net_allow", "presets", "attrs")) -> dict:
+    """Three-way merge of the shared settings, approvals, presets and per-skill lane/pin, key by key: the side
+    that changed since the last sync wins; when both changed, this machine keeps its own and says so. Before a
+    first sync (no base) two lists merge as a union, and a value still at its default takes the peer's."""
+    out = {}
+    for ns in spaces:
+        local, remote = shared_get(c, ns), reg.get(ns)
+        if remote is None:  # a peer on an older version, or a fresh remote: nothing to take
+            continue
+        base = json.loads(meta_get(c, f"sync:{ns}") or "null")
+        first = base is None
+        base, newbase, clash = base or {}, dict(base or {}), []
+        for k in sorted(set(local) | set(remote)):
+            if ns == "attrs" and k not in local:
+                continue  # a skill not here (yet): its lane and pin arrive with it
+            l, r, b = local.get(k), remote.get(k), base.get(k)
+            if l == r:
+                v = l
+            elif l == b:
+                v = r
+            elif r == b and not first:
+                v = l
+            elif first and (l is None or (ns == "config" and l == DEFAULT_CONFIG.get(k))):
+                v = r
+            elif first and isinstance(l, list) and isinstance(r, list):
+                v = l + [x for x in r if x not in l]  # keep this side's order (marketplace order matters)
+            elif first:
+                v = l
+            else:
+                v = l
+                clash.append(k)
+            if v != l:
+                shared_set(c, ns, k, v)
+            if r is None:
+                newbase.pop(k, None)
+            else:
+                newbase[k] = r  # what the remote holds; a value kept here reads as a local change next time
+        meta_set(c, f"sync:{ns}", json.dumps(newbase, sort_keys=True))
+        if clash:
+            say(f"[keep]  {ns}: {', '.join(clash[:8])} changed here and on a peer; kept this machine's")
+        out[ns] = clash
+    peers = {k: v for k, v in reg.get("peers", {}).items() if k != peer_name()}
+    meta_set(c, "peers", json.dumps(peers, sort_keys=True))
+    return out
+
+
+def fleet(c) -> tuple[dict, set, set]:
+    """What the other peers last reported: last use per skill, and the skills they hold (referenced or pinned)."""
+    peers = json.loads(meta_get(c, "peers") or "{}")
+    last, held, pinned = {}, set(), set()
+    for p in peers.values():
+        for name, (_, ts) in p.get("usage", {}).items():
+            last[name] = max(last.get(name, 0), ts or 0)
+        held.update(p.get("held", []))
+        pinned.update(p.get("pinned", []))
+    return last, held, pinned
+
+
+def peer_report(c, cfg) -> dict:
+    return {"at": now(), "version": VERSION, "skills": c.execute("select count(*) from skills").fetchone()[0],
+            "usage": {r[0]: [r[1], r[2] or 0] for r in
+                      c.execute("select name, uses, last_used from skills where uses > 0 or last_used")},
+            "held": sorted({r[0] for r in c.execute("select distinct skill from refs")}),
+            "pinned": sorted({r[0] for r in c.execute("select name from skills where pinned=1")})}
+
+
+def unquarantine_synced(name: str, h: str):
+    """A skill admitted from the remote no longer needs the copies an older pull held back."""
+    qroot = HOME / "quarantine"
+    for q in qroot.glob(f"{name}-*") if qroot.is_dir() else ():
+        if q.is_dir() and re.fullmatch(re.escape(name) + r"-\d{8}-\d{6}(-\d+)?", q.name) and sync_hash(q) == h:
+            rm(q)
+
+
 def sync_merge(c, reg: dict, policy: str) -> dict:
     """Three-way merge per skill: base = the hash both sides had at the last sync."""
+    sync_shared(c, reg, ("config", "net_allow"))  # settings and approvals first: vetting reads them
     base = {r[0]: r[1] for r in c.execute("select name, hash from sync_state")}
     local = {r["name"]: r for r in c.execute("select * from skills")}
     stats = {"new": 0, "took": 0, "kept": 0, "conflict": 0, "removed": 0, "held": 0}
     cfg = config()
-    for skill, hosts in reg.get("net_allow", {}).items():
-        c.executemany("insert or ignore into net_allow values (?,?,?,?)", [(skill, h, now(), "sync") for h in hosts])
 
     def admit(rdir: Path, name: str, meta: dict) -> bool:
-        rep = vet(c, cfg, rdir, name, review=False, quiet=True)
+        # A peer's bank is yours: the content scan still runs, but egress is not an admission gate here.
+        # Approvals travel with the sync and `use` enforces them, so the skill behaves as it does on the peer.
+        rep = vet(c, cfg, rdir, name, review=False, quiet=True, egress_gate=False)
         if rep["ok"]:
+            unquarantine_synced(name, sync_hash(rdir))
             return True
+        h = sync_hash(rdir)
+        qroot = HOME / "quarantine"
+        if any(sync_hash(q) == h for q in (qroot.glob(f"{name}-*") if qroot.is_dir() else ())):
+            stats["held"] += 1  # already held at this version; one copy is enough
+            return False
         q = quarantine(rdir, name, rep, dict(meta, source=meta.get("source", "")))
         say(f"[held]  {name} from the remote failed vetting ({'; '.join(rep['blocks'])}); in {q}")
         stats["held"] += 1
@@ -3002,9 +3155,7 @@ def sync_merge(c, reg: dict, policy: str) -> dict:
             stats["removed"] += 1
         else:
             say(f"[keep]  {name}: removed on another machine, but edited here; kept (remove it to agree)")
-    for p, members in reg.get("presets", {}).items():
-        c.executemany("insert or ignore into presets values (?,?)", [(p, s) for s in members if s in local or
-                                                                     in_bank(s)])
+    sync_shared(c, reg, ("presets", "attrs"))  # after the skills, so presets and lanes find their members
     return stats
 
 
@@ -3045,11 +3196,17 @@ def sync_export(c, remote: dict):
                                "link_source": str(p.resolve()) if r["link"] else "", "pinned": r["pinned"],
                                "hash": h}
         c.execute("insert or replace into sync_state values (?,?)", (name, h))
-    for row in c.execute("select name, group_concat(skill, '\n') s from presets group by name"):
-        reg["presets"][row["name"]] = sorted(row["s"].split("\n"))
-    reg["net_allow"] = {}
-    for row in c.execute("select skill, host from net_allow where by != 'global' order by skill, host"):
-        reg["net_allow"].setdefault(row["skill"], []).append(row["host"])
+    reg["version"] = 3
+    for ns in ("config", "net_allow", "presets", "attrs"):
+        reg[ns] = shared_get(c, ns)
+        meta_set(c, f"sync:{ns}", json.dumps(reg[ns], sort_keys=True))  # both sides now agree on this
+    cfg = config()
+    reg["peers"] = dict(remote.get("peers", {}))
+    me, rep = peer_name(cfg), peer_report(c, cfg)
+    prev = reg["peers"].get(me, {})
+    if {k: v for k, v in prev.items() if k != "at"} == {k: v for k, v in rep.items() if k != "at"}:
+        rep["at"] = prev.get("at", rep["at"])  # nothing new from this peer: no commit just to say so
+    reg["peers"][me] = rep
     (SYNC / "registry.json").write_text(json.dumps(reg, indent=1, sort_keys=True) + "\n")
 
 
@@ -3058,6 +3215,7 @@ def cmd_pull(a):
     reg = sync_fetch(c)
     st = sync_merge(c, reg, "theirs" if a.theirs else "mine" if a.mine else "ask")
     write_registry(c, config())
+    install_gate(config())
     c.commit()
     say("pull: " + ", ".join(f"{v} {k}" for k, v in st.items()))
     return st
@@ -3065,22 +3223,74 @@ def cmd_pull(a):
 
 def cmd_push(a):
     c = db()
-    reg = sync_fetch(c)
-    st = sync_merge(c, reg, "theirs" if a.theirs else "mine" if a.mine else "ask")
-    if st["conflict"]:
+    for attempt in range(3):  # another peer may push between our fetch and push: merge again on top of it
+        reg = sync_fetch(c)
+        st = sync_merge(c, reg, "theirs" if a.theirs else "mine" if a.mine else "ask")
+        if st["conflict"]:
+            c.commit()
+            die(f"{st['conflict']} conflict(s); resolve with `skills-gate push --mine` or `pull --theirs`")
+        sync_export(c, reg)
+        write_registry(c, config())
+        install_gate(config())
         c.commit()
-        die(f"{st['conflict']} conflict(s); resolve with `skills-gate push --mine` or `pull --theirs`")
-    sync_export(c, reg)
-    write_registry(c, config())
-    c.commit()
-    sync_git(["add", "-A"])
-    if sync_git(["diff", "--cached", "--quiet"], check=False).returncode == 0:
-        say("push: nothing changed")
-        return
-    sync_git(["commit", "-q", "-m", f"skills-gate sync {time.strftime('%Y-%m-%d %H:%M')}"])
-    sync_git(["push", "-q", "origin", "HEAD:main"])
+        sync_git(["add", "-A"])
+        if sync_git(["diff", "--cached", "--quiet"], check=False).returncode == 0:
+            say("push: nothing changed")
+            return
+        sync_git(["commit", "-q", "-m", f"skills-gate sync {peer_name()} {time.strftime('%Y-%m-%d %H:%M')}"])
+        r = sync_git(["push", "-q", "origin", "HEAD:main"], check=False)
+        if r.returncode == 0:
+            break
+        if attempt == 2:
+            die(f"git push failed: {r.stderr.strip()[:300]}")
+        say("push: the remote moved meanwhile; merging again")
     say(f"push: bank of {len(list((SYNC / 'skills').iterdir()))} skills sent to {meta_get(c, 'remote')}"
         f" (merged: {', '.join(f'{v} {k}' for k, v in st.items())})")
+
+
+def cmd_join(a):
+    """Make this machine a peer of a bank: init if needed, set the remote, take the fleet's bank and settings,
+    report in. --all also gates the harness folders, writes the prompt hook and installs the nightly sync."""
+    if not CONFIG.is_file():
+        cmd_init(argparse.Namespace())
+    cmd_remote(argparse.Namespace(url=a.url))
+    cmd_pull(argparse.Namespace(theirs=False, mine=False))
+    cmd_push(argparse.Namespace(theirs=False, mine=False))
+    if a.all:
+        cmd_gate(argparse.Namespace(dry_run=False))
+        cmd_hook(argparse.Namespace(write=True, remove=False))
+        cmd_timer(argparse.Namespace())
+    else:
+        say("next: `skills-gate gate`, `skills-gate hook --write`, `skills-gate timer` (or join again with --all)")
+    cmd_peers(argparse.Namespace())
+
+
+def cmd_peers(a):
+    """Every machine on the bank, from the last sync (no network): when it synced, its version, its bank."""
+    c = db()
+    cfg = config()
+    reg_p = SYNC / "registry.json"
+    reg = json.loads(reg_p.read_text()) if reg_p.is_file() else {}
+    me = peer_name(cfg)
+    fleet_names = set(reg.get("skills", {}))
+    here = {r[0] for r in c.execute("select name from skills")}
+    say(f"{'peer':<16} {'last sync':<17} {'version':<8} {'skills':>6}  used")
+    for name, p in sorted(reg.get("peers", {}).items()):
+        say(f"{name + (' *' if name == me else ''):<16} "
+            f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(p.get('at', 0))):<17} "
+            f"{p.get('version', '?'):<8} {p.get('skills', 0):>6}  {len(p.get('usage', {}))}")
+    if not reg.get("peers"):
+        say("(no peers reported yet; `skills-gate push` reports this one)")
+    missing, extra = sorted(fleet_names - here), sorted(here - fleet_names)
+    qroot = HOME / "quarantine"
+    held = sorted({q.name.rsplit("-", 2)[0] for q in qroot.iterdir()} if qroot.is_dir() else set())
+    if missing:
+        say(f"on the bank but not here ({len(missing)}): {', '.join(missing[:12])}"
+            + (f"; held in quarantine: {', '.join(held[:8])}" if held else ""))
+    if extra:
+        say(f"here but not on the bank yet ({len(extra)}): {', '.join(extra[:12])} (push sends them)")
+    if not missing and not extra and fleet_names:
+        say(f"in step: this bank matches the remote ({len(here)} skills)")
 
 
 # ---------------------------------------------------------------------------------------------------- agents
@@ -3394,6 +3604,11 @@ def main(argv=None):
         g.add_argument("--theirs", action="store_true", help="on a conflict, take the remote copy")
         g.add_argument("--mine", action="store_true", help="on a conflict, keep this machine's copy")
         p.set_defaults(f=fn)
+    p = sp.add_parser("join", help="make this machine a peer of a bank: init, remote, pull, report in")
+    p.add_argument("url")
+    p.add_argument("--all", action="store_true", help="also gate, write the prompt hook and install the timers")
+    p.set_defaults(f=cmd_join)
+    sp.add_parser("peers", help="every machine on the bank and whether this one is in step").set_defaults(f=cmd_peers)
     p = sp.add_parser("agents", help="known harnesses: list | add NAME [--dir] | remove NAME | ignore NAME")
     p.add_argument("action", nargs="?", choices=["list", "add", "remove", "ignore"])
     p.add_argument("name", nargs="?")

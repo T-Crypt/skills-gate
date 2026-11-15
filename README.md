@@ -134,10 +134,20 @@ so an agent can choose without a second call. Harnesses without a shell can use 
   Project links go into `.git/info/exclude`, never into your `.gitignore`.
 - **Presets and lanes.** `preset save review-kit code-review blast-radius`, then
   `on --preset review-kit` or `on --lane media`.
-- **One bank on every machine.** `remote <git-url>`, then `push` and `pull`. A three-way merge
-  per skill takes the side that changed; when both changed, skills-gate keeps yours, saves theirs
-  in `conflicts/` and waits for `--theirs` or `--mine`. With a remote set, `skills-gate timer`
-  adds a nightly `push` (which pulls and merges first). Secrets (`.env`, keys, tokens) and files
+- **One bank on every machine.** Point every machine at one private git repo and they act as peers:
+  `skills-gate join <git-url> --all` on a new machine sets the remote, takes the bank, gates the
+  harness folders, writes the hook and installs the timers. A three-way merge per skill takes the
+  side that changed; when both changed, skills-gate keeps yours, saves theirs in `conflicts/` and
+  waits for `--theirs` or `--mine`. The same merge runs key by key over the shared settings
+  (always-on set, prune and cold windows, trust policy, suggestion tuning, marketplace), network
+  approvals and revokes, presets, and each skill's lane and pin. Paths stay per machine. A skill
+  banked on one peer is banked on every peer: the content scan still runs on arrival, and a skill
+  whose network use you have not approved arrives with the same `use` warning it has at home,
+  not as a quarantine hold. Each peer reports its usage and its references, so the nightly tidy
+  sends a skill to cold storage only when no machine has used, pinned or referenced it.
+  `skills-gate peers` lists the machines and says whether this one is in step. The timer pulls
+  before the tidy and pushes after it, and an hourly push keeps peers in step during the day; a
+  push with nothing new makes no commit. Secrets (`.env`, keys, tokens) and files
   over 10 MB stay home, and an empty remote never empties your bank.
 - **16 known harnesses.** `agents` lists Claude Code, the shared `~/.agents` folder, Codex,
   OpenCode, Pi, OMP, Cursor, Gemini, Copilot, Windsurf, Roo, Cline, Goose, Kiro, Qwen and Trae,
@@ -228,6 +238,7 @@ choosing the right skill matter more than seeing every skill at once. They can s
 | `project show \| save \| sync` | The project's `.skills-gate.json` |
 | `preset list \| show \| save \| add \| rm` | Named skill sets |
 | `remote <url>` / `push` / `pull [--theirs \| --mine]` | Sync the bank through git |
+| `join <url> [--all]` / `peers` | Make this machine a peer of a bank / every peer and whether this one is in step |
 | `agents [add \| remove \| ignore] <name>` | Known harnesses and which ones are gated; `ignore` hides one for good |
 | `lane [name]` / `set-lane <lane> <skills>` | Read or change the lanes |
 | `pin` / `unpin` / `remove <skills>` | Exempt from pruning / move to cold storage |
