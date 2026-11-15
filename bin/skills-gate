@@ -2486,6 +2486,13 @@ def cmd_tidy(a):
         p = bank_path(r["name"])
         if not (p / "SKILL.md").is_file():
             say(f"[broken] {r['name']}: {p} has no SKILL.md (a linked source moved?)")
+    qroot = HOME / "quarantine"
+    for q in sorted(qroot.iterdir()) if qroot.is_dir() else ():
+        m = re.fullmatch(r"(.+)-\d{8}-\d{6}(-\d+)?", q.name)
+        if m and q.is_dir() and in_bank(m.group(1)) and held_hash(q) == sync_hash(bank_path(m.group(1))):
+            say(f"[quarantine] {q.name}: the bank already has this exact version; hold cleared")
+            if not dry:
+                rm(q)
     if not dry:
         reindex(c)
     changed = changed_since_review(c)
@@ -3047,11 +3054,16 @@ def peer_report(c, cfg) -> dict:
             "pinned": sorted({r[0] for r in c.execute("select name from skills where pinned=1")})}
 
 
+def held_hash(q: Path) -> str:
+    """A quarantine entry's content hash, without the vetting report it carries."""
+    return tree_hash(q, skip=lambda f, rel: sync_skip(f, rel) or str(rel) == ".skills-gate-report.json")
+
+
 def unquarantine_synced(name: str, h: str):
     """A skill admitted from the remote no longer needs the copies an older pull held back."""
     qroot = HOME / "quarantine"
     for q in qroot.glob(f"{name}-*") if qroot.is_dir() else ():
-        if q.is_dir() and re.fullmatch(re.escape(name) + r"-\d{8}-\d{6}(-\d+)?", q.name) and sync_hash(q) == h:
+        if q.is_dir() and re.fullmatch(re.escape(name) + r"-\d{8}-\d{6}(-\d+)?", q.name) and held_hash(q) == h:
             rm(q)
 
 
@@ -3072,7 +3084,7 @@ def sync_merge(c, reg: dict, policy: str) -> dict:
             return True
         h = sync_hash(rdir)
         qroot = HOME / "quarantine"
-        if any(sync_hash(q) == h for q in (qroot.glob(f"{name}-*") if qroot.is_dir() else ())):
+        if any(held_hash(q) == h for q in (qroot.glob(f"{name}-*") if qroot.is_dir() else ())):
             stats["held"] += 1  # already held at this version; one copy is enough
             return False
         q = quarantine(rdir, name, rep, dict(meta, source=meta.get("source", "")))

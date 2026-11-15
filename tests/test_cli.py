@@ -844,6 +844,7 @@ class TrustTest(Base):
         q = home2 / ".skills-gate" / "quarantine" / "uploader-20261115-000000"
         import shutil
         shutil.copytree(home2 / ".skills-gate" / "bank" / "uploader", q)
+        (q / ".skills-gate-report.json").write_text('{"blocks": ["calls out"]}')  # every held copy has one
         db2 = sqlite3.connect(home2 / ".skills-gate" / "gate.db")
         db2.execute("delete from skills where name='uploader'")
         db2.execute("delete from sync_state where name='uploader'")
@@ -851,6 +852,11 @@ class TrustTest(Base):
         db2.close()
         shutil.rmtree(home2 / ".skills-gate" / "bank" / "uploader")
         self.assertIn("1 new", self.sg("pull", env=env2).stdout)
+        self.assertFalse(q.exists())
+        # a stale hold for a version the bank already has is cleared by the tidy
+        shutil.copytree(home2 / ".skills-gate" / "bank" / "uploader", q)
+        (q / ".skills-gate-report.json").write_text("{}")
+        self.assertIn("hold cleared", self.sg("tidy", env=env2).stdout)
         self.assertFalse(q.exists())
         # a revoke on one machine reaches the other (it used to come back on the next pull)
         self.sg("net", "revoke", "weather", env=env2)
