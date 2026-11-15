@@ -490,6 +490,24 @@ class ReviewRegressionTest(Base):
         self.sg("pull", env=env2)
         return home2, env2
 
+    def test_a_rejection_on_one_peer_reaches_the_other(self):
+        home2, env2 = self.two_machines()
+        d = sqlite3.connect(self.sgh / "gate.db")
+        d.execute("insert into distill values ('fp1', 'card-flow', 'rejected', 1, '[]')")
+        d.commit()
+        d.close()
+        draft = home2 / ".skills-gate" / "drafts" / "card-flow"
+        draft.mkdir(parents=True)
+        (draft / "SKILL.md").write_text("---\nname: card-flow\ndescription: x\n---\n")
+        d2 = sqlite3.connect(home2 / ".skills-gate" / "gate.db")
+        d2.execute("insert into distill values ('fp1', 'card-flow', 'draft', 1, '[]')")
+        d2.commit()
+        d2.close()
+        self.sg("push")
+        self.sg("pull", env=env2)
+        self.assertIn("rejected", self.sg("distill", "list", env=env2).stdout)
+        self.assertFalse(draft.exists())
+
     def set_config2(self, home2, **kw):
         p = home2 / ".skills-gate" / "config.json"
         cfg = json.loads(p.read_text())
@@ -515,6 +533,17 @@ class ReviewRegressionTest(Base):
         self.sg("push")
         self.sg("pull", env=env2)
         self.assertEqual(self.cfg2(home2)["cold_days"], 60)
+        # a key that becomes shared after the first sync (an upgrade): the peer still at the default takes it
+        db2 = sqlite3.connect(home2 / ".skills-gate" / "gate.db")
+        base = json.loads(db2.execute("select value from meta where key='sync:config'").fetchone()[0])
+        base.pop("suggest", None)
+        db2.execute("update meta set value=? where key='sync:config'", (json.dumps(base),))
+        db2.commit()
+        db2.close()
+        self.set_config(suggest={"limit": 2})
+        self.sg("push")
+        self.sg("pull", env=env2)
+        self.assertEqual(self.cfg2(home2)["suggest"]["limit"], 2)
         # presets: a deletion travels too
         self.sg("preset", "save", "kit", "code-review")
         self.sg("push")
@@ -927,3 +956,112 @@ class TrustTest(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DistillTest(Base):
+    """Recurring work in session logs becomes skill drafts; nothing reaches the bank until accepted."""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        tool = self.bin / "cardctl"
+        tool.write_text("#!/bin/sh\nexit 0\n")
+        tool.chmod(0o755)
+        self.env = dict(self.env, PATH=f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}")
+        self.set_config(distill={"min_sessions": 4, "min_projects": 2, "max_drafts": 3})
+
+    def session(self, n: int, project: str, commands: list):
+        d = self.home / ".claude" / "projects" / f"-x-{project}"
+        d.mkdir(parents=True, exist_ok=True)
+        with (d / f"s{n}.jsonl").open("w") as fh:
+            for i, cmd in enumerate(commands):
+                fh.write(json.dumps({"cwd": f"/work/{project}", "timestamp": "2026-11-15T10:00:00Z", "message": {
+                    "content": [{"type": "tool_use", "id": f"t{n}-{i}", "name": "Bash",
+                                 "input": {"command": cmd}}]}}) + "\n")
+
+    def work(self, sessions=6):
+        for n in range(sessions):
+            self.session(n, ["alpha", "beta", "gamma"][n % 3], [
+                "ls -la",
+                "cardctl status --json 2>&1 | tail -3",
+                f"CARD_TOKEN=s3cr3tvalue{n} cardctl drain --wait 30",
+                "python3 -c \"\nimport json\nclass Thing: pass\n\"",
+                "git status --short"])
+
+    def test_recurring_work_becomes_a_draft_and_noise_does_not(self):
+        self.work()
+        out = self.sg("distill").stdout
+        self.assertIn("cardctl status --json -> cardctl drain --wait", out)
+        self.assertNotIn("ls", out.split("workflow", 1)[1].split("draft(s)")[0].replace("cardctl", ""))
+        self.assertNotIn("class", out)
+        drafts = self.listing(self.sgh / "drafts")
+        self.assertEqual(len(drafts), 1)
+        md = (self.sgh / "drafts" / drafts[0] / "SKILL.md").read_text()
+        self.assertIn("2>&1", md)
+        self.assertNotIn("s3cr3tvalue", md)
+        self.assertIn("CARD_TOKEN=<redacted>", md)
+        self.assertIn("alpha", md)
+        # a second run does not draft the same workflow twice
+        self.assertIn("0 draft(s)", self.sg("distill").stdout)
+
+    def test_a_workflow_a_bank_skill_covers_is_not_drafted(self):
+        self.work()
+        skill(self.src, "card-ops", "Card operations", "Run `cardctl status --json`, then `cardctl drain --wait 30`.\n")
+        self.sg("add", str(self.src / "card-ops"))
+        out = self.sg("distill").stdout
+        self.assertIn("in card-ops", out)
+        self.assertFalse((self.sgh / "drafts").exists() and self.listing(self.sgh / "drafts"))
+
+    def test_accept_vets_and_banks_it_reject_never_proposes_again(self):
+        self.work()
+        self.sg("distill")
+        name = self.listing(self.sgh / "drafts")[0]
+        self.assertIn("## Steps", self.sg("distill", "show", name).stdout)
+        self.sg("distill", "accept", name, "--lane", "ops")
+        self.assertRegex(self.sg("show", name).stdout, r"lane:?\s+ops")
+        self.assertTrue((self.sgh / "bank" / name / "SKILL.md").is_file())
+        self.assertFalse((self.sgh / "bank" / name / ".distill.json").exists())
+        self.assertIn("accepted", self.sg("distill", "list").stdout)
+        self.assertRegex(self.sg("distill").stdout, r"accepted\s+cardctl status")  # known, not drafted again
+        # reject: a different workflow, gone for good
+        for n in range(6, 12):
+            self.session(n, ["alpha", "beta"][n % 2], ["cardctl flash --slot 2", "cardctl verify --deep"])
+        self.sg("distill")
+        other = [d for d in self.listing(self.sgh / "drafts")][0]
+        self.sg("distill", "reject", other)
+        self.assertIn("rejected", self.sg("distill").stdout)
+        self.assertEqual(self.listing(self.sgh / "drafts"), [])
+
+    def test_draft_cmd_writes_the_playbook_and_a_dead_one_falls_back(self):
+        self.work()
+        writer = self.tmp / "writer.py"
+        writer.write_text("import json,sys\nc=json.load(sys.stdin)\n"
+                          "print('thinking...')\nprint('---\\nname: whatever\\ndescription: Use when the card needs a "
+                          "drain.\\n---\\n\\n# Card drain\\n\\nWritten by the model. token ghp_' + 'a'*36)\n")
+        self.set_config(distill={"min_sessions": 4, "min_projects": 2, "draft_cmd": [sys.executable, str(writer)]})
+        self.sg("distill")
+        name = self.listing(self.sgh / "drafts")[0]
+        md = (self.sgh / "drafts" / name / "SKILL.md").read_text()
+        self.assertTrue(md.startswith("---\nname: " + name))
+        self.assertIn("Written by the model", md)
+        self.assertNotIn("ghp_aaaa", md)
+        # the shipped writer prints nothing when the model is down, so the template is used
+        self.sg("distill", "reject", name)
+        shipped = Path(__file__).resolve().parents[1] / "bin" / "skills-gate-draft"
+        self.set_config(distill={"min_sessions": 4, "min_projects": 2, "draft_cmd": [sys.executable, str(shipped)]})
+        for n in range(6, 12):
+            self.session(n, ["alpha", "beta"][n % 2], ["cardctl flash --slot 2", "cardctl verify --deep"])
+        env = dict(self.env, SKILLS_GATE_LLM_URL="http://127.0.0.1:9/v1", SKILLS_GATE_DRAFT_TIMEOUT="3")
+        self.sg("distill", env=env)
+        other = self.listing(self.sgh / "drafts")[0]
+        self.assertIn("Drafted by `skills-gate distill`", (self.sgh / "drafts" / other / "SKILL.md").read_text())
+
+    def test_tidy_distills_on_schedule(self):
+        self.work()
+        out = self.sg("tidy").stdout
+        self.assertIn("[distill] 1 new skill draft", out)
+        self.assertNotIn("new skill draft", self.sg("tidy").stdout)  # not due again for a week
+        self.assertIn("1 draft(s) wait", self.sg("tidy").stdout)
+        self.assertIn("skill drafts from your recurring work: 1", self.sg("status").stdout)
+

@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Local skill writer for `skills-gate distill`. Reads one candidate workflow (JSON on stdin: the command shapes,
+redacted examples, how many sessions and which projects) and asks a local model (any OpenAI-compatible chat API,
+default llama-swap on this box) to turn it into a SKILL.md. Prints the SKILL.md, or nothing when the model is down or
+answers without front matter, and skills-gate falls back to its plain template. The result is always a draft.
+
+Configure with distill.draft_cmd in ~/.skills-gate/config.json:
+  "draft_cmd": "skills-gate-draft"
+Environment: SKILLS_GATE_LLM_URL (default http://127.0.0.1:9090/v1), SKILLS_GATE_DRAFT_MODEL (default agent),
+SKILLS_GATE_DRAFT_TIMEOUT (default 300 s), SKILLS_GATE_LLM_MAX_TOKENS (default 8192)."""
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+PROMPT = """You turn a workflow someone repeats into an agent skill: a SKILL.md an AI coding agent loads when the \
+same job comes up again. Below are the commands, mined from their own shell history in agent sessions (values were \
+replaced or redacted), in the order they usually run, with how often and where.
+
+Write the SKILL.md and nothing else:
+- Front matter between --- lines with `name: {name}` and a one-line `description:` that starts with "Use when" and \
+names the situation, so an agent can tell from the description alone whether it fits.
+- A short title and one paragraph on what the workflow is for, inferred only from the commands.
+- "## Steps": numbered, each with the command (placeholders like <path> where values vary), why it runs, and what a \
+good result looks like.
+- "## Checks": how to tell it worked, and the one mistake to avoid.
+Plain, direct sentences. No emojis, no marketing words. Do not invent hosts, tokens, flags or tools that are not in \
+the commands. Never include a secret.
+
+WORKFLOW
+name: {name}
+seen in {sessions} sessions across these projects: {projects}
+commands (shape -> example):
+{commands}
+"""
+
+
+def ask(url: str, model: str, prompt: str, timeout: int) -> str:
+    req = urllib.request.Request(
+        url.rstrip("/") + "/chat/completions",
+        data=json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.2,
+                         "max_tokens": int(os.environ.get("SKILLS_GATE_LLM_MAX_TOKENS", "8192"))}).encode(),
+        headers={"Content-Type": "application/json", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        msg = json.load(r)["choices"][0]["message"]
+        return (msg.get("content") or "").strip()
+
+
+def main() -> int:
+    cand = json.load(sys.stdin)
+    commands = "\n".join(f"- {s} -> {ex}" for s, ex in zip(cand.get("shapes", []), cand.get("examples", [])))
+    prompt = (PROMPT.replace("{name}", cand.get("name", "workflow"))
+              .replace("{sessions}", str(cand.get("sessions", 0)))
+              .replace("{projects}", ", ".join(cand.get("projects", [])[:10]) or "unknown")
+              .replace("{commands}", commands))
+    try:
+        text = ask(os.environ.get("SKILLS_GATE_LLM_URL", "http://127.0.0.1:9090/v1"),
+                   os.environ.get("SKILLS_GATE_DRAFT_MODEL", "agent"), prompt,
+                   int(os.environ.get("SKILLS_GATE_DRAFT_TIMEOUT", "300")))
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError, KeyError) as e:
+        print(f"skills-gate-draft: model unavailable ({str(getattr(e, 'reason', e))[:120]}); template used",
+              file=sys.stderr)
+        return 0
+    text = re.sub(r"(?s)<think>.*?</think>", "", text).strip()
+    text = re.sub(r"^```(?:markdown|md)?\n|\n```$", "", text).strip()
+    m = re.search(r"(?ms)^---\n.*?\n---\n", text)
+    if not m or "description:" not in m.group(0):
+        print("skills-gate-draft: the model answered without front matter; template used", file=sys.stderr)
+        return 0
+    print(text[m.start():])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

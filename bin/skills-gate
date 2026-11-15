@@ -25,6 +25,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -41,7 +42,7 @@ VERSION = "0.4.0"
 HOME = Path(os.environ.get("SKILLS_GATE_HOME", Path.home() / ".skills-gate")).expanduser()
 BANK, COLD, GATED = HOME / "bank", HOME / "cold", HOME / "gated"
 DB, CONFIG, LANES_DIR = HOME / "gate.db", HOME / "config.json", HOME / "lanes"
-SYNC, CONFLICTS = HOME / "sync", HOME / "conflicts"
+SYNC, CONFLICTS, DRAFTS = HOME / "sync", HOME / "conflicts", HOME / "drafts"
 GATE_DIR = HOME / "skill" / "skills-gate"
 GATE_NAME = "skills-gate"
 MANIFEST = ".skills-gate.json"
@@ -91,6 +92,12 @@ DEFAULT_CONFIG = {
               "nightly_review": 20},
     # Prompt-time suggestions: at most `limit`, only above `min_score`, and within `ratio` of the best match.
     "suggest": {"limit": 3, "min_score": 7.0, "ratio": 0.55, "min_prompt": 12},
+    # Workflows you repeat become skill drafts: the tidy mines the last `days` of session logs every `every_days`,
+    # for command sequences seen in `min_sessions` sessions across `min_projects` projects that no bank skill covers,
+    # and writes at most `max_drafts` drafts to ~/.skills-gate/drafts. Nothing reaches the bank until you accept it.
+    # draft_cmd: optional writer (gets the candidate JSON on stdin, prints SKILL.md); bundled: skills-gate-draft.
+    "distill": {"days": 14, "every_days": 7, "min_sessions": 5, "min_projects": 2, "max_drafts": 3, "draft_cmd": "",
+                "draft_timeout": 600, "ignore": []},
 }
 
 # Known harnesses: global skill folder, project folder, session logs. Paths are each tool's documented or usual
@@ -232,6 +239,8 @@ def db(timeout: float = 15) -> sqlite3.Connection:
     create table if not exists reviews (name text primary key, hash text not null, at integer not null,
         level text not null default '', egress text not null default '{}', verdict text not null default '',
         notes text not null default '');
+    create table if not exists distill (fp text primary key, name text not null, status text not null,
+        at integer not null, shapes text not null default '[]');
     create index if not exists events_skill on events (skill, at);
     """)
     have = {r[1] for r in c.execute("pragma table_info(skills)")}
@@ -2504,6 +2513,15 @@ def cmd_tidy(a):
     elif changed:
         say("[review] " + ", ".join(r["name"] for r in changed[:10]) + (", ..." if len(changed) > 10 else "")
             + " never reviewed or changed since; run `skills-gate review --changed`")
+    every = int(cfg["distill"].get("every_days", 7))
+    if every > 0 and not dry and now() - int(meta_get(c, "distill_at", "0")) >= every * DAY:
+        _, made = distill_run(c, cfg, quiet=True)
+        if made:
+            say(f"[distill] {len(made)} new skill draft(s) from your recurring work: "
+                f"{', '.join(m['name'] for m in made)}; `skills-gate distill list`")
+    waiting = c.execute("select count(*) from distill where status='draft'").fetchone()[0]
+    if waiting:
+        say(f"[distill] {waiting} draft(s) wait for you: skills-gate distill show NAME, then accept or reject")
     keep = always_on(cfg)
     leaks = [(h, e.name) for h, d in harness_dirs(cfg).items() for e in d.iterdir()
              if not e.name.startswith(".") and e.name not in keep and (e / "SKILL.md").is_file()
@@ -2639,6 +2657,9 @@ def cmd_status(a):
     peers = json.loads(meta_get(c, "peers") or "{}")
     say(f"remote: {meta_get(c, 'remote') or 'none'}" + (f"  (peer {peer_name(cfg)}; also on the bank: "
         f"{', '.join(sorted(peers))})" if peers else ""))
+    drafts = c.execute("select count(*) from distill where status='draft'").fetchone()[0]
+    if drafts:
+        say(f"skill drafts from your recurring work: {drafts} (skills-gate distill list)")
     say("always-loaded listing (tokens): " + ", ".join(f"{k} {v}" for k, v in visible_cost(cfg).items()))
 
 
@@ -2883,6 +2904,389 @@ def cmd_update(a):
     say(f"updated {len(plan)} skill(s); old copies in {COLD}")
 
 
+# ---------------------------------------------------------------------------------------------------- distill
+
+# Programs too generic to be a workflow on their own (shell, coreutils, interpreters running ad-hoc code).
+DISTILL_GENERIC = set("""cd ls cat head tail grep rg sed awk cut sort uniq wc tr echo printf for do done if then fi else
+elif while until case esac true false sleep find xargs mkdir rm cp mv ln touch chmod chown test [ [[ ]] python python3
+node bash sh zsh env export set unset source . date which type tee less more diff stat file readlink realpath basename
+dirname jq exit return break continue local read eval import from def try except with print command builtin wait
+kill pkill pgrep ps free du df tar unzip zip wget scp sudo cmp column fold paste nl od xxd base64 sha256sum md5sum
+python3.14 pip pip3 git""".split())
+# Programs whose subcommand is the workflow (git commit, gh pr, systemctl restart): kept only with one.
+DISTILL_SUBCMD = {"git", "gh", "ssh", "systemctl", "journalctl", "docker", "podman", "npm", "npx", "pnpm", "uv",
+                  "cargo", "go", "make", "curl", "pct", "qm", "kubectl", "tailscale", "pip", "pip3"}
+# git plumbing every session runs; it only counts inside a longer sequence (add, commit, push).
+DISTILL_PLUMBING = re.compile(r"^git (status|log|diff|show|fetch|rev-parse|branch|worktree|remote|stash|ls-files)\b")
+REDACT = [
+    (re.compile(r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|AUTH|CREDENTIALS?)[A-Z0-9_]*)=\S+"), r"\1=<redacted>"),
+    (re.compile(r"(?i)(authorization:\s*(?:bearer|basic|token)?\s*)[^'\"\s]+"), r"\1<redacted>"),
+    (re.compile(r"(?i)(--?(?:token|password|passwd|secret|api-?key|auth)[= ])\S+"), r"\1<redacted>"),
+    (re.compile(r"://[^/@\s:]+:[^/@\s]+@"), "://<redacted>@"),
+    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[abpr]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})\b"),
+     "<redacted>"),
+    (re.compile(r"\b[A-Za-z0-9+/_-]{40,}={0,2}"), "<redacted>"),
+]
+HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\1\b", re.S)
+
+
+def redact(text: str) -> str:
+    for rx, sub in REDACT:
+        text = rx.sub(sub, text)
+    return text
+
+
+def split_commands(cmd: str) -> list[str]:
+    """One shell command line into its simple commands, on && || ; | & and newlines outside quotes, so a
+    multi-line `python3 -c "..."` or a `grep "a|b"` stays one command."""
+    out, cur, quote, i = [], [], "", 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote:
+            cur.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < len(cmd):
+                cur.append(cmd[i + 1])
+                i += 1
+            elif ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+            cur.append(ch)
+        elif ch == "\\" and i + 1 < len(cmd):
+            cur.append(cmd[i:i + 2] if cmd[i + 1] != "\n" else " ")
+            i += 1
+        elif ch == "&" and ((cur and cur[-1] in "<>") or cmd[i + 1:i + 2] == ">"):
+            cur.append(ch)  # a redirect (2>&1, &>), not a separator
+        elif ch in ";|&\n()":
+            out.append("".join(cur))
+            cur = []
+        elif ch == "#" and (not cur or cur[-1].isspace()):
+            while i < len(cmd) and cmd[i] != "\n":
+                i += 1
+            continue
+        else:
+            cur.append(ch)
+        i += 1
+    out.append("".join(cur))
+    return [x.strip() for x in out if x.strip()]
+
+
+def runnable(word: str) -> bool:
+    """A program this machine can run, or a script path: not a word from inside a quoted script."""
+    return "/" in word or word.endswith((".sh", ".py")) or bool(shutil.which(word))
+
+
+def command_shape(seg: str) -> str | None:
+    """The stable part of one shell command: program, subcommands and flags; paths and values become nothing.
+    `nvidia-smi --query-compute-apps=pid --format=csv` -> `nvidia-smi --query-compute-apps --format`."""
+    try:
+        t = shlex.split(seg, comments=True)
+    except ValueError:
+        t = seg.split()
+    while t and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", t[0]) or t[0] in ("sudo", "timeout", "nohup", "time",
+                                                                               "exec", "env", "command", "nice", "ionice", "stdbuf", "-n")
+                 or re.fullmatch(r"-?\d+[smh]?", t[0])):
+        t = t[1:]
+    if not t:
+        return None
+    prog = Path(t[0]).name
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9._+-]{0,40}", prog) or not runnable(t[0]):
+        return None
+    out = [prog]
+    for x in t[1:]:
+        if len(out) >= 5 or x in (">", ">>", "2>&1", "<", "2>/dev/null", "&>/dev/null"):
+            break
+        if re.fullmatch(r"--?[A-Za-z][A-Za-z0-9-]*(=.*)?", x):
+            out.append(x.split("=")[0])
+        elif re.fullmatch(r"[a-z][a-z0-9_:-]{1,30}", x):
+            out.append(x)
+        else:
+            break  # a path, a value, a quoted script: what follows is arguments, not the command
+    sub = [x for x in out[1:] if not x.startswith("-")]
+    longf = [x for x in out[1:] if x.startswith("--")]
+    if prog in DISTILL_SUBCMD:
+        return " ".join(out) if sub else None
+    if prog in DISTILL_GENERIC:
+        return None
+    return " ".join(out) if sub or longf or len(prog) > 3 else None
+
+
+def session_commands(f: Path):
+    """(cwd, [(shape, redacted example)]) for one session log: shell tool calls only, heredoc bodies dropped."""
+    cwd, seq = "", []
+    with f.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if '"command"' not in line and '"cmd"' not in line and '"cwd"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(d, dict):
+                for o in (d, d.get("payload") if isinstance(d.get("payload"), dict) else {}):
+                    if isinstance(o.get("cwd"), str) and o["cwd"]:
+                        cwd = o["cwd"]
+            for _, tool, args in tool_calls(d):
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except ValueError:
+                        args = {"command": args}
+                if not isinstance(args, dict):
+                    continue
+                cmd = args.get("command") or args.get("cmd")
+                if isinstance(cmd, list):
+                    cmd = " ".join(map(str, cmd))
+                if not isinstance(cmd, str) or not cmd.strip():
+                    continue
+                if isinstance(args.get("workdir") or args.get("cwd"), str):
+                    cwd = args.get("workdir") or args.get("cwd")
+                for seg in split_commands(HEREDOC.sub("", cmd)):
+                    s = command_shape(seg)
+                    if s and (not seq or seq[-1][0] != s):
+                        seq.append((s, redact(seg.strip())[:200]))
+    return cwd, seq
+
+
+def project_of(cwd: str) -> str:
+    if not cwd:
+        return "?"
+    p = Path(cwd)
+    for q in (p, *p.parents):
+        if (q / ".git").exists():
+            return q.name
+    return p.name or str(p)
+
+
+def mine_work(cfg: dict, days: int) -> dict:
+    """Every recurring command shape and 3-step sequence in the window's session logs, with the sessions and
+    projects it came from. Reads tool-call arguments only, never message text."""
+    since = now() - days * DAY
+    shapes, seqs, examples, last = {}, {}, {}, {}
+    for src, root in cfg.get("usage_sources", {}).items():
+        root = Path(root).expanduser() if root else None
+        if not root or not root.is_dir():
+            continue
+        for f in root.rglob("*.jsonl"):
+            try:
+                mtime = int(f.stat().st_mtime)
+                if mtime < since:
+                    continue
+                cwd, seq = session_commands(f)
+            except OSError:
+                continue
+            sid, proj = f"{src}:{f.stem}", project_of(cwd)
+            for s, ex in seq:
+                shapes.setdefault(s, [set(), set()])
+                shapes[s][0].add(sid)
+                shapes[s][1].add(proj)
+                examples.setdefault(s, ex)
+                last[s] = max(last.get(s, 0), mtime)
+            names = [s for s, _ in seq]
+            for i in range(len(names) - 2):
+                k = tuple(names[i:i + 3])
+                if len(set(k)) == 3:
+                    seqs.setdefault(k, [set(), set()])
+                    seqs[k][0].add(sid)
+                    seqs[k][1].add(proj)
+    return {"shapes": shapes, "seqs": seqs, "examples": examples, "last": last}
+
+
+def bank_corpus() -> dict[str, str]:
+    """Each bank skill's playbook and scripts, lower-cased, for the 'already covered' check."""
+    out = {}
+    for p in sorted(BANK.iterdir()) if BANK.is_dir() else ():
+        if not (p / "SKILL.md").is_file():
+            continue
+        parts = []
+        for f, rel in files_of(p):
+            if f.suffix.lower() in (".md", ".sh", ".bash", ".py", ".txt") and len(parts) < 40:
+                with contextlib.suppress(OSError):
+                    parts.append(f.read_text(encoding="utf-8", errors="replace")[:60_000].lower())
+        out[p.name] = "\n".join(parts)
+    return out
+
+
+def shape_key(shape: str) -> str:
+    """The words a playbook must contain to count as covering a shape: the program and its first subcommand/flag."""
+    return " ".join(shape.split()[:2]).lower()
+
+
+def distill_candidates(c, cfg, mined: dict) -> list[dict]:
+    d = cfg["distill"]
+    min_s, min_p = int(d["min_sessions"]), int(d["min_projects"])
+    ignore = [re.compile(x) for x in d.get("ignore", [])]
+    raw = []
+    for k, (ss, pp) in mined["seqs"].items():
+        if len(ss) >= min_s and len(pp) >= min_p and not all(DISTILL_PLUMBING.match(s) for s in k):
+            raw.append({"shapes": list(k), "sessions": ss, "projects": pp})
+    for s, (ss, pp) in mined["shapes"].items():
+        if len(ss) >= min_s and len(pp) >= min_p and not DISTILL_PLUMBING.match(s) and not s.startswith("git "):
+            raw.append({"shapes": [s], "sessions": ss, "projects": pp})
+    raw = [r for r in raw if not any(rx.search(" ".join(r["shapes"])) for rx in ignore)]
+    raw.sort(key=lambda r: (-len(r["sessions"]), -len(r["shapes"])))
+    # cluster: candidates seen in mostly the same sessions are one workflow
+    groups, used = [], set()
+    for r in raw:
+        r["shapes"] = [x for x in r["shapes"] if x not in used]  # a command belongs to one workflow
+        if not r["shapes"] or (len(r["shapes"]) == 1 and DISTILL_PLUMBING.match(r["shapes"][0])):
+            continue
+        used.update(r["shapes"])
+        for g in groups:
+            inter = len(g["sessions"] & r["sessions"])
+            if (inter / max(1, len(g["sessions"] | r["sessions"])) >= 0.5 or set(r["shapes"]) <= set(g["shapes"])
+                    or len(set(r["shapes"]) & set(g["shapes"])) >= 2):
+                g["shapes"] += [s for s in r["shapes"] if s not in g["shapes"]]
+                g["sessions"] |= r["sessions"]
+                g["projects"] |= r["projects"]
+                break
+        else:
+            groups.append({"shapes": list(r["shapes"]), "sessions": set(r["sessions"]), "projects": set(r["projects"])})
+    corpus = bank_corpus()
+    status = {r[0]: (r[1], r[2]) for r in c.execute("select fp, status, name from distill")}
+    out = []
+    for g in groups:
+        if any(not x.startswith("git ") for x in g["shapes"]):  # plumbing that tags along is not the workflow
+            g["shapes"] = [x for x in g["shapes"] if not DISTILL_PLUMBING.match(x)]
+        g["shapes"] = g["shapes"][:8]
+        fp = hashlib.sha1("\n".join(sorted(g["shapes"])).encode()).hexdigest()[:16]
+        covered = next((n for n, text in corpus.items()
+                        if text and all(shape_key(s) in text for s in g["shapes"])), "")
+        st, nm = status.get(fp, ("", ""))
+        out.append({"fp": fp, "shapes": g["shapes"], "sessions": len(g["sessions"]), "projects": sorted(g["projects"]),
+                    "examples": [mined["examples"].get(s, s) for s in g["shapes"]],
+                    "last": max(mined["last"].get(s, 0) for s in g["shapes"]),
+                    "covered_by": covered, "status": st, "name": nm or distill_name(g["shapes"])})
+    return out
+
+
+def distill_name(shapes: list[str]) -> str:
+    """A slug from the most specific shape: the one that is not git plumbing, with the most words."""
+    pick = max(shapes, key=lambda s: (not s.startswith("git "), len(s.split())))
+    words = [w.lstrip("-") for w in pick.split()][:2]
+    base = re.sub(r"[^a-z0-9]+", "-", "-".join(words).lower()).strip("-")[:48] or "workflow"
+    return base if base.endswith("-flow") or len(shapes) == 1 else base + "-flow"
+
+
+def draft_skill(cfg, cand: dict) -> str:
+    """SKILL.md for a candidate: from distill.draft_cmd (the bundled skills-gate-draft asks a local model) when it
+    answers with front matter, else a plain template. Either way it is a draft until `distill accept`."""
+    cmd = cfg["distill"].get("draft_cmd")
+    if cmd:
+        try:
+            argv = [os.path.expanduser(x) for x in (cmd if isinstance(cmd, list) else cmd.split())]
+            r = subprocess.run(argv, input=json.dumps(cand), capture_output=True, text=True,
+                               timeout=int(cfg["distill"].get("draft_timeout", 600)))
+            text = r.stdout.strip()
+            m = re.search(r"^---\n.*?\n---\n", text, re.S | re.M)
+            if m and "description:" in m.group(0):
+                text = text[m.start():]
+                text = re.sub(r"(?m)^name:.*$", f"name: {cand['name']}", text, count=1)
+                return redact(text) + "\n"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    projects = ", ".join(cand["projects"][:6]) + (" and others" if len(cand["projects"]) > 6 else "")
+    desc = (f"Recurring workflow from your own sessions: {'; '.join(cand['shapes'][:3])}. Use when doing this again "
+            f"in {projects}.")
+    steps = "\n".join(f"{i}. `{s}`\n   Example: `{ex}`" for i, (s, ex) in
+                      enumerate(zip(cand["shapes"], cand["examples"]), 1))
+    return (f"---\nname: {cand['name']}\ndescription: {json.dumps(desc)}\n---\n\n# {cand['name']}\n\n"
+            f"Drafted by `skills-gate distill` on {day(now())} from {cand['sessions']} sessions across "
+            f"{len(cand['projects'])} projects ({projects}). Edit it into a real playbook before you accept it: say "
+            f"why each step runs and what a good result looks like.\n\n## Steps\n\n{steps}\n")
+
+
+def distill_run(c, cfg, days: int | None = None, limit: int | None = None, dry: bool = False,
+                quiet: bool = False) -> tuple[list, list]:
+    d = cfg["distill"]
+    cands = distill_candidates(c, cfg, mine_work(cfg, int(days or d["days"])))
+    fresh = [x for x in cands if not x["status"] and not x["covered_by"]]
+    made = []
+    for cand in fresh[: int(d["max_drafts"] if limit is None else limit)]:
+        name = cand["name"]
+        while in_bank(name) or (DRAFTS / name).exists():
+            name = re.sub(r"-(\d+)$", lambda m: f"-{int(m.group(1)) + 1}", name) if re.search(r"-\d+$", name) \
+                else name + "-2"
+        cand["name"] = name
+        if dry:
+            made.append(cand)
+            continue
+        dst = DRAFTS / name
+        dst.mkdir(parents=True)
+        (dst / "SKILL.md").write_text(draft_skill(cfg, cand))
+        (dst / ".distill.json").write_text(json.dumps(cand, indent=1))
+        c.execute("insert or replace into distill values (?,?,?,?,?)", (cand["fp"], name, "draft", now(),
+                                                                       json.dumps(cand["shapes"])))
+        event(c, name, "distill", f"{cand['sessions']} sessions, {len(cand['projects'])} projects")
+        made.append(cand)
+        if not quiet:
+            say(f"[draft] {name}: {cand['sessions']} sessions, {len(cand['projects'])} projects -> {dst}")
+    if not dry:
+        meta_set(c, "distill_at", now())
+    return cands, made
+
+
+def cmd_distill(a):
+    cfg = config()
+    c = db()
+    act = a.action or "run"
+    if act == "run":
+        cands, made = distill_run(c, cfg, a.days, a.limit, a.dry_run)
+        c.commit()
+        say(f"{'sessions':>8} {'projects':>8}  {'state':<16} workflow")
+        for x in cands[: a.show]:
+            state = x["status"] or (f"in {x['covered_by']}" if x["covered_by"] else
+                                    "would draft" if a.dry_run and x in made else "new")
+            say(f"{x['sessions']:>8} {len(x['projects']):>8}  {short(state, 16):<16} {' -> '.join(x['shapes'])[:110]}")
+        if not cands:
+            say(f"no workflow recurs in {cfg['distill']['min_sessions']}+ sessions and "
+                f"{cfg['distill']['min_projects']}+ projects in the last {a.days or cfg['distill']['days']} days")
+        say(f"{len(made)} draft(s) {'would be ' if a.dry_run else ''}written to {DRAFTS}"
+            + ("; read one: skills-gate distill show NAME, then accept or reject it" if made else ""))
+        return
+    if act == "list":
+        rows = c.execute("select name, status, at, shapes from distill order by at desc").fetchall()
+        for r in rows:
+            say(f"{r['name']:<36} {r['status']:<9} {day(r['at'])}  {' -> '.join(json.loads(r['shapes']))[:80]}")
+        if not rows:
+            say("no drafts yet; `skills-gate distill` mines your sessions for one")
+        return
+    if not a.name:
+        die(f"distill {act} needs a draft name (skills-gate distill list)")
+    row = c.execute("select * from distill where name=? and status='draft'", (a.name,)).fetchone()
+    src = DRAFTS / a.name
+    if not row or not (src / "SKILL.md").is_file():
+        die(f"no open draft {a.name!r}; `skills-gate distill list`")
+    if act == "show":
+        say((src / "SKILL.md").read_text())
+        say(f"<!-- {src}; edit it there, then: skills-gate distill accept {a.name} [--lane L] | reject {a.name} -->")
+        return
+    if act == "reject":
+        c.execute("update distill set status='rejected', at=? where fp=?", (now(), row["fp"]))
+        rm(src)
+        c.commit()
+        say(f"[reject] {a.name}: this workflow will not be proposed again")
+        return
+    rep = vet(c, cfg, src, a.name)
+    if not rep["ok"]:
+        c.commit()
+        die(f"{a.name} did not pass vetting; fix the draft in {src} and accept again")
+    staged = Path(tempfile.mkdtemp(prefix="sg-draft-")) / a.name
+    shutil.copytree(src, staged, ignore=shutil.ignore_patterns(".distill.json", *SKIP_PARTS))
+    name = register(c, staged, lane=a.lane, source=f"distill:{row['fp']}", kind="distill")
+    rm(staged.parent)
+    if not name:
+        die(f"{a.name}: the draft's front matter has no usable name")
+    if rep["review"]["verdict"] != "none":
+        record_review(c, name, rep)
+    c.execute("update distill set status='accepted', at=? where fp=?", (now(), row["fp"]))
+    rm(src)
+    write_registry(c, cfg)
+    install_gate(cfg)
+    c.commit()
+    say(f"[accept] {name} is in the bank; `skills-gate push` (or the hourly sync) gives it to your other machines")
+
+
 # ---------------------------------------------------------------------------------------------------- push / pull
 
 SECRET_RX = re.compile(r"(^\.env(\..*)?$|\.pem$|\.key$|\.p12$|^id_(rsa|ed25519|ecdsa)|credentials|\.token$|"
@@ -2939,7 +3343,7 @@ def sync_fetch(c) -> dict:
 
 # Settings every peer shares. Paths (harness_dirs, usage_sources, ref_roots, project_dirs) stay per machine.
 SHARED_CONFIG = ("always_on", "prune_days", "cold_days", "marketplace", "market_ttl_hours", "market", "trust",
-                 "suggest", "ignore_agents")
+                 "suggest", "ignore_agents", "distill")
 
 
 def peer_name(cfg: dict | None = None) -> str:
@@ -2961,6 +3365,9 @@ def shared_get(c, ns: str) -> dict:
                 c.execute("select name, group_concat(skill, '\n') from presets group by name")}
     if ns == "attrs":
         return {r[0]: {"lane": r[1], "pinned": r[2]} for r in c.execute("select name, lane, pinned from skills")}
+    if ns == "distill":  # decisions on mined workflows, so no peer proposes what you already turned down
+        return {r[0]: [r[1], r[2]] for r in
+                c.execute("select fp, name, status from distill where status in ('accepted', 'rejected')")}
     raise KeyError(ns)
 
 
@@ -2984,11 +3391,17 @@ def shared_set(c, ns: str, key: str, value):
         c.execute("delete from presets where name=?", (key,))
         c.executemany("insert or ignore into presets values (?,?)",
                       [(key, s) for s in value or [] if in_bank(s)])
+    elif ns == "distill" and value is not None:
+        row = c.execute("select name, status from distill where fp=?", (key,)).fetchone()
+        if row and row["status"] == "draft":
+            rm(DRAFTS / row["name"])  # decided on a peer; this machine's draft of it is moot
+        c.execute("insert into distill values (?,?,?,?,'[]') on conflict(fp) do update set status=excluded.status",
+                  (key, value[0], value[1], now()))
     elif ns == "attrs" and value is not None:
         c.execute("update skills set lane=?, pinned=? where name=?", (value["lane"], value["pinned"], key))
 
 
-def sync_shared(c, reg: dict, spaces=("config", "net_allow", "presets", "attrs")) -> dict:
+def sync_shared(c, reg: dict, spaces=("config", "net_allow", "presets", "attrs", "distill")) -> dict:
     """Three-way merge of the shared settings, approvals, presets and per-skill lane/pin, key by key: the side
     that changed since the last sync wins; when both changed, this machine keeps its own and says so. Before a
     first sync (no base) two lists merge as a union, and a value still at its default takes the peer's."""
@@ -2998,12 +3411,13 @@ def sync_shared(c, reg: dict, spaces=("config", "net_allow", "presets", "attrs")
         if remote is None:  # a peer on an older version, or a fresh remote: nothing to take
             continue
         base = json.loads(meta_get(c, f"sync:{ns}") or "null")
-        first = base is None
+        base_none = base is None
         base, newbase, clash = base or {}, dict(base or {}), []
         for k in sorted(set(local) | set(remote)):
             if ns == "attrs" and k not in local:
                 continue  # a skill not here (yet): its lane and pin arrive with it
             l, r, b = local.get(k), remote.get(k), base.get(k)
+            first = base_none or k not in base  # never synced, or a key that became shared since
             if l == r:
                 v = l
             elif l == b:
@@ -3167,7 +3581,7 @@ def sync_merge(c, reg: dict, policy: str) -> dict:
             stats["removed"] += 1
         else:
             say(f"[keep]  {name}: removed on another machine, but edited here; kept (remove it to agree)")
-    sync_shared(c, reg, ("presets", "attrs"))  # after the skills, so presets and lanes find their members
+    sync_shared(c, reg, ("presets", "attrs", "distill"))  # after the skills, so presets and lanes find their members
     return stats
 
 
@@ -3210,7 +3624,7 @@ def sync_export(c, remote: dict):
                                "link_source": ls, "pinned": r["pinned"], "hash": h}
         c.execute("insert or replace into sync_state values (?,?)", (name, h))
     reg["version"] = 3
-    for ns in ("config", "net_allow", "presets", "attrs"):
+    for ns in ("config", "net_allow", "presets", "attrs", "distill"):
         reg[ns] = shared_get(c, ns)
         meta_set(c, f"sync:{ns}", json.dumps(reg[ns], sort_keys=True))  # both sides now agree on this
     cfg = config()
@@ -3619,6 +4033,16 @@ def main(argv=None):
         g.add_argument("--theirs", action="store_true", help="on a conflict, take the remote copy")
         g.add_argument("--mine", action="store_true", help="on a conflict, keep this machine's copy")
         p.set_defaults(f=fn)
+    p = sp.add_parser("distill", help="turn workflows you repeat across projects into skill drafts: "
+                                      "run | list | show NAME | accept NAME | reject NAME")
+    p.add_argument("action", nargs="?", choices=["run", "list", "show", "accept", "reject"])
+    p.add_argument("name", nargs="?")
+    p.add_argument("--days", type=int, help="window of session logs to mine (default distill.days)")
+    p.add_argument("--limit", type=int, help="drafts to write this run (default distill.max_drafts)")
+    p.add_argument("--show", type=int, default=15, help="candidates to list")
+    p.add_argument("--lane", help="lane for an accepted draft (default: guessed)")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(f=cmd_distill)
     p = sp.add_parser("join", help="make this machine a peer of a bank: init, remote, pull, report in")
     p.add_argument("url")
     p.add_argument("--all", action="store_true", help="also gate, write the prompt hook and install the timers")
