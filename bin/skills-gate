@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """skills-gate: one global skill in front of every skill on the machine.
 
-Agents see a single always-on skill, `skills-gate`. It carries a short registry (one lane per category, one line
-per skill). Everything else lives in the bank and is pulled in only when a task needs it:
+Agents see a single always-on skill, `skills-gate`. It carries a short registry (one lane per category, the skill
+names in each). Everything else lives in the bank and is pulled in only when a task needs it:
 
+  skills-gate suggest "<task>"       the banked skills that fit a task, ranked (also runs as a prompt hook)
   skills-gate use <skill>            print a skill's playbook into the session (on demand, recorded)
   skills-gate on <skill> [--global]  link it into this project (or every harness) until it goes stale
-  skills-gate tidy                   the daily pass: collect usage, switch off stale skills, cool unused ones,
-                                     regenerate the registry, re-gate leaks, report context cost
+  skills-gate tidy                   the daily pass: usage from every harness, stale skills off, cold storage,
+                                     references held, registry rebuilt, leaks re-gated, context cost
 
 Python 3.9+, standard library only. Home: ~/.skills-gate (override with SKILLS_GATE_HOME).
 Run `skills-gate --help` or `skills-gate <command> --help`.
@@ -15,11 +16,17 @@ Run `skills-gate --help` or `skills-gate <command> --help`.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import datetime
+import difflib
 import hashlib
+import io
 import json
+import math
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -29,16 +36,21 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HOME = Path(os.environ.get("SKILLS_GATE_HOME", Path.home() / ".skills-gate")).expanduser()
 BANK, COLD, GATED = HOME / "bank", HOME / "cold", HOME / "gated"
 DB, CONFIG, LANES_DIR = HOME / "gate.db", HOME / "config.json", HOME / "lanes"
+SYNC, CONFLICTS = HOME / "sync", HOME / "conflicts"
 GATE_DIR = HOME / "skill" / "skills-gate"
 GATE_NAME = "skills-gate"
+MANIFEST = ".skills-gate.json"
 DAY = 86400
+SKIP_PARTS = {".git", "node_modules", "__pycache__"}
+IGNORE = shutil.ignore_patterns(*SKIP_PARTS)
+NAME_RX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 
 DEFAULT_CONFIG = {
-    # Global skill folders, one per harness. Only the ones that exist are touched.
+    # Global skill folders, one per harness. Only the ones that exist are touched. `skills-gate agents` lists more.
     "harness_dirs": {
         "claude": "~/.claude/skills",
         "agents": "~/.agents/skills",        # Pi, HADAL, OpenCode, Codex and others read this one
@@ -52,17 +64,57 @@ DEFAULT_CONFIG = {
     "always_on": [],
     # A skill switched on but unused this many days is switched off.
     "prune_days": 14,
-    # A bank skill unused this many days (and not pinned) moves to cold storage.
+    # A bank skill unused this many days (not pinned, not referenced) moves to cold storage.
     "cold_days": 120,
-    # Marketplace sources for `search --market`: "github" (code search for SKILL.md).
-    "marketplace": ["github"],
-    # Claude Code transcripts, scanned by `tidy` for Skill tool calls (structure only, never content).
-    "usage_sources": {"claude": "~/.claude/projects"},
+    # Marketplace sources for `search --market`, in order: "skills.sh", "gh-skill" (GitHub code search through
+    # `gh skill search`, falling back to plain code search), "github" (plain code search only).
+    "marketplace": ["skills.sh", "gh-skill"],
+    "market_ttl_hours": 24,
+    # The local catalog (`market refresh`, run daily by the timer): sources to gather, extra repos to index
+    # (your own or private ones), skills validated per run, and how often a validated skill is checked again.
+    "market": {"sources": ["skills.sh"], "repos": [], "budget": 400, "revalidate_days": 14},
+    # Session logs scanned by `tidy` for skill loads: tool names and arguments only, never message text.
+    "usage_sources": {
+        "claude": "~/.claude/projects",
+        "pi": "~/.pi/agent/sessions",
+        "omp": "~/.omp/agent/sessions",
+        "codex": "~/.codex/sessions",
+    },
+    # Folders (prompts, role files, configs) whose mentions of a bank skill keep it out of cold storage.
+    "ref_roots": [],
+    # Prompt-time suggestions: at most `limit`, only above `min_score`, and within `ratio` of the best match.
+    "suggest": {"limit": 3, "min_score": 7.0, "ratio": 0.55, "min_prompt": 12},
+}
+
+# Known harnesses: global skill folder, project folder, session logs. Paths are each tool's documented or usual
+# location; override any of them in config.json. `manual` ones curate their own folder and are never gated by `init`.
+KNOWN_AGENTS = {
+    "claude":   {"home": "~/.claude", "global": "~/.claude/skills", "project": ".claude/skills",
+                 "sessions": "~/.claude/projects"},
+    "agents":   {"home": "~/.agents", "global": "~/.agents/skills", "project": ".agents/skills",
+                 "note": "shared folder read by Pi, OpenCode, Codex, Amp and others"},
+    "codex":    {"home": "~/.codex", "global": "~/.codex/skills", "project": ".agents/skills",
+                 "sessions": "~/.codex/sessions"},
+    "opencode": {"home": "~/.config/opencode", "global": "~/.config/opencode/skills", "project": ".opencode/skills"},
+    "pi":       {"home": "~/.pi/agent", "global": "~/.pi/agent/skills", "project": ".pi/skills",
+                 "sessions": "~/.pi/agent/sessions"},
+    "omp":      {"home": "~/.omp/agent", "global": "~/.omp/agent/skills", "project": ".omp/skills",
+                 "sessions": "~/.omp/agent/sessions", "manual": True, "note": "curates its own links"},
+    "cursor":   {"home": "~/.cursor", "global": "~/.cursor/skills", "project": ".cursor/skills"},
+    "gemini":   {"home": "~/.gemini", "global": "~/.gemini/skills", "project": ".gemini/skills"},
+    "copilot":  {"home": "~/.copilot", "global": "~/.copilot/skills", "project": ".github/skills"},
+    "windsurf": {"home": "~/.codeium/windsurf", "global": "~/.codeium/windsurf/skills", "project": ".windsurf/skills"},
+    "roo":      {"home": "~/.roo", "global": "~/.roo/skills", "project": ".roo/skills"},
+    "cline":    {"home": "~/.cline", "global": "~/.cline/skills", "project": ".clinerules/skills"},
+    "goose":    {"home": "~/.config/goose", "global": "~/.config/goose/skills", "project": ".goose/skills"},
+    "kiro":     {"home": "~/.kiro", "global": "~/.kiro/skills", "project": ".kiro/skills"},
+    "qwen":     {"home": "~/.qwen", "global": "~/.qwen/skills", "project": ".qwen/skills"},
+    "trae":     {"home": "~/.trae", "global": "~/.trae/skills", "project": ".trae/skills"},
 }
 
 # Lane guesses for skills added without one. Order matters: first match wins.
 LANE_RULES = [
-    ("security", r"\b(security|exploit|bounty|hackerone|reverse|pentest|ctf|malware|re)\b"),
+    ("security", r"\b(security|exploits?|bounty|hackerone|reverse.engineer\w*|pentest\w*|ctf|malware|vulnerab\w*)\b"),
     ("media", r"(video|motion|caption|film|animation|comfy|image|audio|reel|brand|banner|slideshow|explainer|"
               r"typography|lower.third|infographic|figma)"),
     ("web", r"(\bui\b|\bux\b|frontend|react|next\.?js|css|tailwind|design.system|web.?app|typescript|component)"),
@@ -83,9 +135,22 @@ def say(*a):
     print(*a, flush=True)
 
 
+def warn(msg: str):
+    print(f"skills-gate: {msg}", file=sys.stderr, flush=True)
+
+
 def die(msg: str, code: int = 1):
     print(f"skills-gate: {msg}", file=sys.stderr)
     raise SystemExit(code)
+
+
+def short(text: str, n: int) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    return text[: n - 3] + "..." if len(text) > n else text
+
+
+def day(ts) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(int(ts))) if ts else "never"
 
 
 def config() -> dict:
@@ -98,6 +163,14 @@ def config() -> dict:
             else:
                 cfg[k] = v
     return cfg
+
+
+def edit_config(fn):
+    """Apply fn to the user's own config.json (not the merged defaults) and write it back."""
+    user = json.loads(CONFIG.read_text()) if CONFIG.is_file() else {}
+    fn(user)
+    HOME.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(user, indent=2) + "\n")
 
 
 def harness_dirs(cfg: dict) -> dict[str, Path]:
@@ -115,9 +188,21 @@ def always_on(cfg: dict) -> set[str]:
     return {GATE_NAME, *cfg.get("always_on", [])}
 
 
-def db() -> sqlite3.Connection:
+def confirm(question: str, yes: bool) -> bool:
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        die(f"{question} Needs the user's yes: run again with --yes once they agree.")
+    return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+
+
+SKILL_COLS = {"keywords": "text not null default ''", "orig_hash": "text not null default ''",
+              "ref": "text not null default ''", "risk": "text not null default ''"}
+
+
+def db(timeout: float = 15) -> sqlite3.Connection:
     HOME.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(DB)
+    c = sqlite3.connect(DB, timeout=timeout)
     c.row_factory = sqlite3.Row
     c.executescript("""
     create table if not exists skills (
@@ -130,12 +215,36 @@ def db() -> sqlite3.Connection:
         primary key (skill, scope));
     create table if not exists events (at integer not null, skill text, kind text not null, detail text);
     create table if not exists meta (key text primary key, value text);
+    create table if not exists harvested (ref text primary key, at integer not null);
+    create table if not exists refs (skill text not null, path text not null, primary key (skill, path));
+    create table if not exists presets (name text not null, skill text not null, primary key (name, skill));
+    create table if not exists market_cache (key text primary key, at integer not null, body text not null);
+    create table if not exists sync_state (name text primary key, hash text not null);
+    create index if not exists events_skill on events (skill, at);
     """)
+    have = {r[1] for r in c.execute("pragma table_info(skills)")}
+    for col, decl in SKILL_COLS.items():
+        if col not in have:
+            c.execute(f"alter table skills add column {col} {decl}")
+    if meta_get(c, "schema") != "2":
+        migrate_v2(c)
     return c
 
 
-def event(c, skill, kind, detail=""):
-    c.execute("insert into events values (?,?,?,?)", (now(), skill, kind, detail))
+def migrate_v2(c):
+    """0.1 -> 0.2: hashes now skip vendored folders, so take a fresh baseline; index the playbook bodies."""
+    for r in c.execute("select name from skills").fetchall():
+        p = bank_path(r["name"])
+        if (p / "SKILL.md").is_file():
+            h = tree_hash(p)
+            c.execute("update skills set hash=?, orig_hash=?, keywords=? where name=?",
+                      (h, h, body_keywords(p / "SKILL.md"), r["name"]))
+    meta_set(c, "schema", "2")
+    c.commit()
+
+
+def event(c, skill, kind, detail="", at=None):
+    c.execute("insert into events values (?,?,?,?)", (at or now(), skill, kind, detail))
 
 
 def meta_get(c, key, default=None):
@@ -150,12 +259,12 @@ def meta_set(c, key, value):
 # ---------------------------------------------------------------------------------------------------- skills
 
 def frontmatter(md: Path) -> dict:
-    """name/description from a SKILL.md front matter, without a YAML dependency (single-line values)."""
+    """name/description from a SKILL.md front matter, without a YAML dependency (single-line or block values)."""
     try:
-        text = md.read_text(encoding="utf-8", errors="replace")
+        text = md.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
     except OSError:
         return {}
-    m = re.match(r"^---\s*\n(.*?)\n---", text, re.S)
+    m = re.match(r"^﻿?---\s*\n(.*?)\n---", text, re.S)
     out = {}
     if m:
         lines = m.group(1).splitlines()
@@ -177,10 +286,33 @@ def frontmatter(md: Path) -> dict:
     return out
 
 
-def tree_hash(path: Path) -> str:
+def body_keywords(md: Path) -> str:
+    """Headings and the opening of a playbook: what `suggest` matches beyond the description."""
+    try:
+        text = md.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
+    except OSError:
+        return ""
+    text = re.sub(r"^﻿?---\s*\n.*?\n---\s*\n", "", text, count=1, flags=re.S)
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    heads = [ln.lstrip("#").strip() for ln in text.splitlines() if ln.startswith("#")]
+    opening = re.sub(r"\s+", " ", re.sub(r"^#.*$", "", text, flags=re.M))[:500]
+    return short(" ".join(heads) + " " + opening, 1200)
+
+
+def files_of(path: Path):
+    for f in sorted(path.rglob("*")):
+        rel = f.relative_to(path)
+        if SKIP_PARTS & set(rel.parts) or not f.is_file():
+            continue
+        yield f, rel
+
+
+def tree_hash(path: Path, skip=None) -> str:
     h = hashlib.sha256()
-    for f in sorted(p for p in path.rglob("*") if p.is_file()):
-        h.update(str(f.relative_to(path)).encode())
+    for f, rel in files_of(path):
+        if skip and skip(f, rel):
+            continue
+        h.update(str(rel).encode())
         try:
             h.update(f.read_bytes())
         except OSError:
@@ -211,7 +343,7 @@ def find_skill_dirs(root: Path, depth: int = 4) -> list[Path]:
     found = []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
         rel = Path(dirpath).relative_to(root)
-        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("node_modules", "__pycache__")]
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in SKIP_PARTS]
         if len(rel.parts) >= depth:
             dirnames[:] = []
         if "SKILL.md" in filenames and Path(dirpath) != root:
@@ -224,37 +356,64 @@ def bank_path(name: str) -> Path:
     return BANK / name
 
 
+def in_bank(name: str) -> bool:
+    p = bank_path(name)
+    return p.exists() or p.is_symlink()
+
+
+def keep_copy(name: str, tag: str) -> Path:
+    """Copy a bank skill to cold/<name>.<tag>-<time> before it is replaced (unique even within one second)."""
+    COLD.mkdir(parents=True, exist_ok=True)
+    base = COLD / f"{name}.{tag}-{time.strftime('%Y%m%d-%H%M%S')}"
+    dst, i = base, 1
+    while dst.exists() or dst.is_symlink():
+        dst, i = Path(f"{base}-{i}"), i + 1
+    shutil.copytree(bank_path(name), dst, symlinks=True)
+    return dst
+
+
+def rm(p: Path):
+    if p.is_dir() and not p.is_symlink():
+        shutil.rmtree(p)
+    elif p.exists() or p.is_symlink():
+        p.unlink()
+
+
 def register(c, src: Path, lane: str | None = None, link: bool = False, source: str = "", force: bool = False,
-             name: str | None = None) -> str | None:
+             name: str | None = None, ref: str = "", kind: str = "add", meta: dict | None = None) -> str | None:
     """Put one skill dir into the bank (copy, or a symlink to its source with link=True) and the registry."""
     fm = frontmatter(src / "SKILL.md")
     name = name or fm.get("name") or src.name
-    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$", name):
+    if not NAME_RX.match(name):
         say(f"[skip]  {src}: unusable skill name {name!r}")
         return None
     if name == GATE_NAME:
         return None
     dst = bank_path(name)
-    if dst.exists() or dst.is_symlink():
+    if in_bank(name):
         if not force:
             say(f"[have]  {name} (already in the bank; --force replaces it)")
             return name
-        shutil.rmtree(dst) if dst.is_dir() and not dst.is_symlink() else dst.unlink()
+        rm(dst)
     BANK.mkdir(parents=True, exist_ok=True)
     if link:
         dst.symlink_to(src.resolve())
     else:
-        shutil.copytree(src, dst, symlinks=False, ignore=shutil.ignore_patterns(".git", "node_modules"))
+        shutil.copytree(src, dst, symlinks=False, ignore=IGNORE)
     desc = fm.get("description", "")
     row = c.execute("select lane, pinned, added_at, last_used, uses from skills where name=?", (name,)).fetchone()
-    lane = lane or (row["lane"] if row else None) or guess_lane(name, desc)
+    meta = meta or {}
+    lane = lane or meta.get("lane") or (row["lane"] if row else None) or guess_lane(name, desc)
+    pinned = meta.get("pinned", row["pinned"] if row else 0)
+    h = tree_hash(dst)
+    risk = scan_level(scan_tree(dst))
     c.execute("insert or replace into skills (name, lane, description, source, link, hash, tokens, pinned, added_at,"
-              " last_used, uses) values (?,?,?,?,?,?,?,?,?,?,?)",
-              (name, lane, desc, source or str(src), int(link), tree_hash(dst), est_tokens(dst / "SKILL.md"),
-               row["pinned"] if row else 0, row["added_at"] if row else now(), row["last_used"] if row else None,
-               row["uses"] if row else 0))
-    event(c, name, "add", source or str(src))
-    say(f"[add]   {name}  lane={lane}{'  (linked)' if link else ''}")
+              " last_used, uses, keywords, orig_hash, ref, risk) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              (name, lane, desc, source or str(src), int(link), h, est_tokens(dst / "SKILL.md"), int(pinned),
+               row["added_at"] if row else now(), row["last_used"] if row else None, row["uses"] if row else 0,
+               body_keywords(dst / "SKILL.md"), h, ref, risk))
+    event(c, name, kind, source or str(src))
+    say(f"[{kind:<5}] {name}  lane={lane}{'  (linked)' if link else ''}{f'  risk={risk}' if risk else ''}")
     return name
 
 
@@ -263,14 +422,96 @@ def get(c, name: str) -> sqlite3.Row:
     if not r:
         hint = c.execute("select name from skills where name like ? limit 5", (f"%{name}%",)).fetchall()
         die(f"no skill {name!r} in the bank" + (f" (close: {', '.join(x[0] for x in hint)})" if hint else
-                                                  "; try `skills-gate search`"))
+                                                  "; try `skills-gate suggest` or `skills-gate search`"))
     return r
 
 
-def touch(c, name: str, kind: str = "use", at: int | None = None):
+def touch(c, name: str, kind: str = "use", at: int | None = None, detail: str = ""):
     c.execute("update skills set last_used=max(coalesce(last_used,0),?), uses=uses+1 where name=?",
               (at or now(), name))
-    event(c, name, kind)
+    event(c, name, kind, detail, at)
+
+
+# ---------------------------------------------------------------------------------------------------- ranking
+
+WORD = re.compile(r"[a-z0-9][a-z0-9+#]*")
+STOP = set("""when with that this from your their into what the for and use used uses using user users
+only also about other than them then each will must should does more most such just like want
+asks need needs make makes made help helps before after over under
+you can are was has have not any all some our its it is be to of in on at by as or an if do so we me my
+please could would there here which who why how get got new now one way thing things let lets yes no ok""".split())
+
+
+def stem(w: str) -> str:
+    for suf in ("ing", "ed", "es", "s"):
+        if len(w) > len(suf) + 3 and w.endswith(suf):
+            w = w[: -len(suf)]
+            break
+    return w[:-1] if len(w) > 4 and w.endswith("e") else w  # write / writes / writing -> writ
+
+
+def toks(text: str) -> list[str]:
+    return [stem(w) for w in WORD.findall((text or "").lower()) if len(w) > 1 and w not in STOP]
+
+
+FIELDS = (("name", 3.0), ("description", 1.0), ("lane", 0.5), ("keywords", 0.4))
+
+
+class Index:
+    """BM25 over name, description, lane and playbook headings. CPU only, rebuilt per call (it takes milliseconds)."""
+
+    def __init__(self, rows):
+        self.docs, self.df, self.name_df = [], {}, {}
+        for r in rows:
+            tf: dict[str, float] = {}
+            for field, w in FIELDS:
+                text = r[field] or ""
+                if field == "name":
+                    text = re.sub(r"[-_.]", " ", text)
+                for t in toks(text):
+                    tf[t] = tf.get(t, 0) + w
+            names = set(toks(re.sub(r"[-_.]", " ", r["name"])))
+            self.docs.append((r, tf, sum(tf.values()) or 1.0, names))
+            for t in tf:
+                self.df[t] = self.df.get(t, 0) + 1
+            for t in names:
+                self.name_df[t] = self.name_df.get(t, 0) + 1
+        self.n = len(self.docs)
+        self.avg = sum(d[2] for d in self.docs) / max(1, self.n)
+
+    def rank(self, query: str, limit: int = 10):
+        q, ql, out = set(toks(query)), query.lower(), []
+        for r, tf, length, names in self.docs:
+            s = 0.0
+            for t in q:
+                f = tf.get(t)
+                if f:
+                    idf = math.log(1 + (self.n - self.df[t] + 0.5) / (self.df[t] + 0.5))
+                    s += idf * f * 2.2 / (f + 1.2 * (0.25 + 0.75 * length / self.avg))
+                if t in names:  # a word rare among skill names is a strong signal even when descriptions overuse it
+                    s += 0.8 * math.log(1 + self.n / self.name_df[t])
+            name = r["name"].lower()
+            if len(name) > 2 and re.search(rf"(?<![a-z0-9-]){re.escape(name)}(?![a-z0-9-])", ql):
+                s += 8.0
+            if s > 0:
+                out.append((round(s + 0.3 * math.log1p(r["uses"]), 2), r))
+        out.sort(key=lambda x: (-x[0], x[1]["name"]))
+        return out[:limit]
+
+
+def min_score(cfg: dict, n_docs: int) -> float:
+    """BM25 scores grow with the bank (idf ~ log N); min_score is set for ~150 skills and scaled for smaller banks."""
+    return round(cfg["suggest"]["min_score"] * min(1.0, math.log1p(n_docs) / 5.0), 2)
+
+
+def confident(hits, cfg: dict, exclude=(), n_docs: int = 150) -> list:
+    s = cfg["suggest"]
+    if not hits:
+        return []
+    top = hits[0][0]
+    bar = min_score(cfg, n_docs)
+    return [(sc, r) for sc, r in hits if sc >= bar and sc >= top * s["ratio"]
+            and r["name"] not in exclude][: s["limit"]]
 
 
 # ---------------------------------------------------------------------------------------------------- linking
@@ -287,16 +528,40 @@ def project_root(start: Path | None = None) -> Path:
     return start
 
 
+def bank_target(link: Path) -> str | None:
+    """The bank skill a symlink points at (absolute or relative, normalized), or None."""
+    try:
+        t = os.readlink(link)
+    except OSError:
+        return None
+    t = os.path.normpath(t if os.path.isabs(t) else os.path.join(str(link.parent), t))
+    for root in {os.path.normpath(str(BANK)), os.path.normpath(os.path.realpath(BANK))}:
+        if t.startswith(root + os.sep):
+            return t[len(root) + 1:].split(os.sep)[0] or None
+    return None
+
+
+def links_to(link: Path, name: str) -> bool:
+    return link.is_symlink() and bank_target(link) == name
+
+
+def points_into_bank(link: Path) -> bool:
+    return bank_target(link) is not None
+
+
 def link_into(target_dir: Path, name: str) -> bool:
     target_dir.mkdir(parents=True, exist_ok=True)
     link = target_dir / name
     src = bank_path(name)
-    if link.is_symlink() and Path(os.readlink(link)) == src:
+    if links_to(link, name):
         return False
     if link.exists() and not link.is_symlink():
         say(f"[keep]  {link} is a real folder, not replaced")
         return False
     if link.is_symlink():
+        if link.exists() and not points_into_bank(link):
+            say(f"[keep]  {link} links somewhere else ({os.readlink(link)}), not replaced")
+            return False
         link.unlink()
     link.symlink_to(src)
     return True
@@ -304,7 +569,7 @@ def link_into(target_dir: Path, name: str) -> bool:
 
 def unlink_from(target_dir: Path, name: str) -> bool:
     link = target_dir / name
-    if link.is_symlink() and Path(os.readlink(link)) in (bank_path(name), bank_path(name).resolve()):
+    if links_to(link, name):
         link.unlink()
         return True
     return False
@@ -315,6 +580,68 @@ def scope_dirs(cfg: dict, scope: str) -> list[Path]:
         return list(harness_dirs(cfg).values())
     root = Path(scope)
     return [root / d for d in cfg["project_dirs"]]
+
+
+def git_exclude(root: Path, rels: list[str]):
+    """Keep project links out of git: they point into this machine's bank. Uses .git/info/exclude, never .gitignore."""
+    info = root / ".git" / "info"
+    if not (root / ".git").is_dir():
+        return
+    ex = info / "exclude"
+    lines = ex.read_text().splitlines() if ex.exists() else []
+    add = [f"/{r}" for r in rels if f"/{r}" not in lines]
+    if add:
+        info.mkdir(parents=True, exist_ok=True)
+        if "# skills-gate links" not in lines:
+            add.insert(0, "# skills-gate links")
+        ex.write_text("\n".join(lines + add) + "\n")
+
+
+# ---------------------------------------------------------------------------------------------------- manifests
+
+def read_manifest(root: Path) -> dict:
+    p = root / MANIFEST
+    m = {"skills": [], "presets": [], "sources": {}}
+    if p.is_file():
+        try:
+            m.update(json.loads(p.read_text()))
+        except ValueError:
+            warn(f"{p} is not valid JSON; ignored")
+    return m
+
+
+def write_manifest(root: Path, m: dict):
+    m["skills"] = sorted(set(m.get("skills", [])))
+    m["presets"] = sorted(set(m.get("presets", [])))
+    m["sources"] = {k: v for k, v in sorted(m.get("sources", {}).items()) if k in m["skills"]}
+    (root / MANIFEST).write_text(json.dumps(m, indent=2) + "\n")
+
+
+def remember_project(c, root: Path):
+    projects = set(json.loads(meta_get(c, "projects", "[]")))
+    if str(root) not in projects:
+        projects.add(str(root))
+        meta_set(c, "projects", json.dumps(sorted(projects)))
+
+
+def manifest_skills(c, root: Path) -> set[str]:
+    m = read_manifest(root)
+    names = set(m.get("skills", []))
+    for p in m.get("presets", []):
+        names |= set(preset_members(c, p, strict=False))
+    return names
+
+
+def preset_members(c, name: str, strict: bool = True) -> list[str]:
+    rows = [r[0] for r in c.execute("select skill from presets where name=? order by skill", (name,))]
+    if not rows and strict:
+        have = [r[0] for r in c.execute("select distinct name from presets order by name")]
+        die(f"no preset {name!r}" + (f"; presets: {', '.join(have)}" if have else "; make one with `preset save`"))
+    return rows
+
+
+def remote_source(row) -> str:
+    return row["source"] if "://" in row["source"] or row["source"].startswith("git@") else ""
 
 
 # ---------------------------------------------------------------------------------------------------- the gate skill
@@ -332,18 +659,20 @@ Pull in only what the task needs; the rest costs no context.
 ## Use
 
 ```bash
+skills-gate suggest "<the task in a sentence>"   # the best-fitting skills, ranked; start here
+skills-gate use <skill>          # print the skill's playbook here and follow it (recorded as used)
 skills-gate lane <lane>          # the skills in one lane: name, when to use, size
 skills-gate search "<words>"     # search the bank by name, purpose and lane
-skills-gate use <skill>          # print the skill's playbook here and follow it (recorded as used)
-skills-gate on <skill>           # keep it loaded for this project (auto-off after {prune_days} idle days)
+skills-gate on <skill> [--save]  # keep it loaded for this project (auto-off after {prune_days} idle days;
+                                 # --save writes it to the project's .skills-gate.json)
 skills-gate off <skill>          # unload it from this project
-skills-gate search "<words>" --market   # find a new skill online; show the user, install only on their yes
-skills-gate add <owner/repo[/path] | git-url | folder>                 # install into the bank (after the yes)
+skills-gate search "<words>" --market    # find a new skill online; show the user, install only on their yes
+skills-gate add <source> --yes   # install into the bank; scans it first. Pass --yes only after the user agreed
 ```
 
 Rules: prefer `use` for a one-off task and `on` for a project that will keep needing it. Never install from the
-market without the user's yes; read the source of anything with few stars. Do not copy bank skills into global
-folders by hand: the daily `tidy` removes anything that bypasses the gate.
+market without the user's yes, and show them what the install scan reported. Do not copy bank skills into
+global folders by hand: the daily `tidy` removes anything that bypasses the gate.
 
 ## Lanes
 """
@@ -359,13 +688,8 @@ def lane_summary(rows) -> str:
     return ", ".join(top)
 
 
-STOP = set("""when with that this from your their into what the for and use used uses using user users skill skills
-task tasks work only also about other than them then each will must should does more most such just like want
-asks need needs make makes made help helps file files code agent agents claude before after over under""".split())
-
-
 def write_registry(c, cfg: dict):
-    """Regenerate the gate skill (lane index) and one file per lane with a line per skill."""
+    """Regenerate the gate skill (lane index with names) and one file per lane with a line per skill."""
     rows = c.execute("select * from skills order by lane, name").fetchall()
     lanes: dict[str, list] = {}
     for r in rows:
@@ -377,15 +701,17 @@ def write_registry(c, cfg: dict):
     for lane, rs in lanes.items():
         lines = [f"# lane: {lane} ({len(rs)} skills)", ""]
         for r in rs:
-            desc = re.sub(r"\s+", " ", r["description"]).strip()
-            desc = desc[:157] + "..." if len(desc) > 160 else desc
-            lines.append(f"- {r['name']} (~{r['tokens']} tok, used {r['uses']}x): {desc}")
+            flag = f", risk {r['risk']}" if r["risk"] in ("high", "medium") else ""
+            lines.append(f"- {r['name']} (~{r['tokens']} tok, used {r['uses']}x{flag}): {short(r['description'], 160)}")
         (LANES_DIR / f"{lane}.md").write_text("\n".join(lines) + "\n")
     GATE_DIR.mkdir(parents=True, exist_ok=True)
     body = [GATE_HEAD.replace("{prune_days}", str(cfg["prune_days"]))]
     body.append("| lane | skills | about |\n|---|---|---|")
     for lane, rs in sorted(lanes.items()):
         body.append(f"| {lane} | {len(rs)} | {lane_summary(rs)} |")
+    body.append("\n## Skills by lane\n")
+    for lane, rs in sorted(lanes.items()):
+        body.append(f"- **{lane}**: " + ", ".join(r["name"] for r in rs))
     hot = c.execute("select name from skills where uses>0 order by last_used desc limit 8").fetchall()
     if hot:
         body.append("\nRecently used: " + ", ".join(r[0] for r in hot) + ".")
@@ -407,6 +733,174 @@ def install_gate(cfg: dict):
         say(f"[gate]  {link}")
 
 
+# ---------------------------------------------------------------------------------------------------- install scan
+
+SCRIPT_EXT = {".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs", ".ts", ".ps1", ".rb", ".pl", ".fish", ".bat"}
+DOC_EXT = {".md", ".markdown", ".txt", ".mdx", ".rst", ""}
+# (severity in scripts, severity in docs or None, rule, pattern)
+SCAN_RULES = [
+    ("high", "medium", "pipe-to-shell", r"(curl|wget|iwr|Invoke-WebRequest)\b[^\n|]*\|\s*(sudo\s+)?(ba|z|da|fi)?sh\b|"
+                                        r"\|\s*(iex|Invoke-Expression)\b"),
+    ("high", "high", "decode-and-run", r"base64\s+(-d|--decode)[^\n]*\|\s*(sudo\s+)?(ba|z)?sh|exec\s*\(\s*(base64|codecs|"
+                                       r"zlib)\.|eval\s*\(\s*(atob|Buffer\.from)|FromBase64String"),
+    ("high", "high", "reverse-shell", r"/dev/tcp/\d|\bnc(at)?\b[^\n]*\s-(e|c)\s|socat\b[^\n]*exec:|pty\.spawn"),
+    ("high", "high", "credential-read", r"\.ssh/id_(rsa|ed25519|ecdsa)|\.aws/credentials|\.netrc\b|\.git-credentials|"
+                                        r"\.config/gh/hosts\.yml|find-generic-password|\.docker/config\.json|"
+                                        r"Login Data|\.password-store"),
+    ("high", "high", "exfil-env", r"\b(env|printenv|set)\b\s*\|\s*(curl|wget|nc)\b|"
+                                  r"(curl|wget)[^\n]*(-d|--data|--post-data)[^\n]*\$\{?\w*(TOKEN|KEY|SECRET|PASS)"),
+    ("high", "high", "destructive", r"rm\s+-[a-z]*r[a-z]*f?\s+(--no-preserve-root\s+)?(/|~|\$HOME)(\s|$|\*)|"
+                                    r"\bmkfs\.|\bdd\s+if=[^\n]*of=/dev/(sd|nvme|disk)"),
+    (None, "high", "prompt-injection", r"(?i)ignore (all |any )?(previous|prior|above|earlier) (instructions|rules)|"
+                                       r"do not (tell|inform|show|alert) the user|without (asking|telling|informing) "
+                                       r"the user|disregard (the |your )?(system|safety|previous)|"
+                                       r"you are no longer bound"),
+    ("medium", None, "persistence", r"\bcrontab\b|\.bashrc|\.zshrc|\.bash_profile|\.profile\b|"
+                                    r"systemctl\s+(--user\s+)?enable|LaunchAgents|authorized_keys"),
+    ("medium", None, "privilege", r"\bsudo\b|chmod\s+[0-7]?[4-7][0-7]{3}\b|chmod\s+[ug]?\+s\b|\bsetuid\b|\bdoas\b"),
+    ("low", None, "network", r"\bcurl\b|\bwget\b|requests\.(get|post|put)|urllib\.request|\bfetch\(|http\.client|"
+                             r"Invoke-WebRequest|socket\.connect"),
+    ("medium", "medium", "encoded-blob", r"[A-Za-z0-9+/]{600,}={0,2}"),
+]
+HIDDEN_RX = re.compile("[​-‏‪-‮⁠-⁤⁦-⁩﻿\U000e0000-\U000e007f]")
+BIDI_RX = re.compile("[‪-‮⁦-⁩\U000e0000-\U000e007f]")
+QUOTES = {'"', "'", "`", "\u201c", "\u2018", "\u00ab"}
+SEV = {"": 0, "low": 1, "medium": 2, "high": 3}
+
+
+def scan_tree(path: Path) -> list[dict]:
+    """Static checks on a skill folder before it reaches an agent. Findings, not a verdict: read what it flags."""
+    out = []
+    total = 0
+    for f, rel in files_of(path):
+        try:
+            data = f.read_bytes()
+        except OSError:
+            continue
+        total += len(data)
+        ext = f.suffix.lower()
+        if data[:4] in (b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe") or data[:2] == b"MZ":
+            out.append({"sev": "high", "rule": "binary", "file": str(rel), "line": 0, "text": "executable binary"})
+            continue
+        if b"\x00" in data[:4096]:
+            if len(data) > 5_000_000:
+                out.append({"sev": "low", "rule": "large-file", "file": str(rel), "line": 0,
+                            "text": f"{len(data) / 1e6:.1f} MB"})
+            continue
+        text = data.decode("utf-8", errors="replace")
+        script = ext in SCRIPT_EXT or text.startswith("#!") or os.access(f, os.X_OK) and ext not in DOC_EXT
+        kind = "script" if script else ("doc" if ext in DOC_EXT else "other")
+        for i, line in enumerate(text.splitlines(), 1):
+            if HIDDEN_RX.search(line):
+                sev = "high" if BIDI_RX.search(line) else "medium"
+                out.append({"sev": sev, "rule": "hidden-unicode", "file": str(rel), "line": i,
+                            "text": short(HIDDEN_RX.sub("<?>", line), 90)})
+            for s_script, s_doc, rule, rx in SCAN_RULES:
+                sev = s_script if kind == "script" else s_doc
+                if not sev:
+                    continue
+                m = re.search(rx, line)
+                if m and rule == "prompt-injection" and line[max(0, m.start() - 1):m.start()] in QUOTES:
+                    continue  # quoted: a skill warning about the phrase, not using it
+                if m:
+                    out.append({"sev": sev, "rule": rule, "file": str(rel), "line": i, "text": short(line.strip(), 90)})
+    if total > 20_000_000:
+        out.append({"sev": "low", "rule": "large-skill", "file": ".", "line": 0, "text": f"{total / 1e6:.0f} MB"})
+    return out
+
+
+def scan_level(findings: list[dict]) -> str:
+    return max((f["sev"] for f in findings), key=lambda s: SEV[s], default="")
+
+
+def print_scan(name: str, path: Path, findings: list[dict], limit: int = 12):
+    files = list(files_of(path))
+    scripts = [str(r) for f, r in files if f.suffix.lower() in SCRIPT_EXT]
+    lvl = scan_level(findings) or "clean"
+    say(f"[scan]  {name}: {len(files)} file(s){', scripts: ' + ', '.join(scripts[:6]) if scripts else ''}  -> {lvl}")
+    for f in sorted(findings, key=lambda x: -SEV[x["sev"]])[:limit]:
+        say(f"        {f['sev']:<6} {f['rule']:<17} {f['file']}:{f['line']}  {f['text']}")
+    if len(findings) > limit:
+        say(f"        ... {len(findings) - limit} more (skills-gate scan {name})")
+
+
+# ---------------------------------------------------------------------------------------------------- sources
+
+def parse_git(src: str) -> tuple[str, str, str, list[str]]:
+    """owner/repo[/sub/path][:skill][@ref] or a git URL (https://github.com/o/r/tree/<ref>/<sub> understood)."""
+    ref, only = "", []
+    if "@" in src and not src.startswith("git@"):
+        src, ref = src.rsplit("@", 1)
+    m = re.match(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?(?:/tree/([^/]+)(?:/(.*))?)?/?$", src)
+    if m:
+        return f"https://github.com/{m.group(1)}/{m.group(2)}.git", m.group(4) or "", ref or (m.group(3) or ""), []
+    if re.match(r"^(https?://|git@|ssh://|file://)", src):
+        return src, "", ref, []
+    if ":" in src:
+        src, skill = src.rsplit(":", 1)
+        only = [skill]
+    parts = src.strip("/").split("/")
+    if len(parts) >= 2 and all(re.match(r"^[A-Za-z0-9._-]+$", p) for p in parts):
+        return f"https://github.com/{parts[0]}/{parts[1]}.git", "/".join(parts[2:]), ref, only
+    die(f"not a folder, git URL or owner/repo[/path][:skill]: {src}")
+
+
+def parse_source(s: str):
+    """The recorded source of a remote install, url#rel@commit, or None for a local one."""
+    if "#" not in s or not ("://" in s or s.startswith("git@")):
+        return None
+    url, rest = s.rsplit("#", 1)
+    rel, _, commit = rest.rpartition("@")
+    return url, ("" if rel == "." else rel), commit
+
+
+def git_run(args: list[str], cwd=None, timeout=300) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                          env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+
+
+def fetch_repo(url: str, ref: str, td: Path, commit: str = "") -> tuple[Path, str]:
+    dst = td / f"r{len(list(td.iterdir()))}"
+    r = git_run(["clone", "-q", "--depth", "1"] + (["--branch", ref] if ref else []) + [url, str(dst)])
+    if r.returncode != 0:
+        die(f"git clone failed for {url}: {r.stderr.strip()[:300]}")
+    head = git_run(["rev-parse", "--short", "HEAD"], cwd=dst).stdout.strip()
+    if commit and not head.startswith(commit[:7]):
+        f = git_run(["fetch", "-q", "--depth", "1", "origin", commit], cwd=dst)
+        if f.returncode == 0 and git_run(["checkout", "-q", "FETCH_HEAD"], cwd=dst).returncode == 0:
+            head = git_run(["rev-parse", "--short", "HEAD"], cwd=dst).stdout.strip()
+        else:
+            warn(f"{url}: commit {commit} not fetchable; using {head}")
+    return dst, head
+
+
+def install_dirs(c, dirs: list[Path], *, remote: bool, yes: bool, allow_risky: bool, lane=None, link=False,
+                 force=False, source_of=lambda d: "", ref="", only=None) -> list[str]:
+    """Scan, ask, register. Remote installs need the user's yes; a high-risk finding needs --allow-risky too."""
+    chosen = [d for d in dirs if not only or d.name in only or frontmatter(d / "SKILL.md").get("name") in only]
+    if not chosen:
+        die("no matching skill in the source" + (f" (wanted: {', '.join(only)})" if only else ""))
+    reports = {d: scan_tree(d) for d in chosen}
+    for d in chosen:
+        print_scan(frontmatter(d / "SKILL.md").get("name") or d.name, d, reports[d])
+    risky = [d for d in chosen if scan_level(reports[d]) == "high"]
+    if risky and not allow_risky:
+        say(f"[block] {len(risky)} skill(s) with high-risk findings are not installed; read them, then pass "
+            f"--allow-risky if they are fine: " + ", ".join(d.name for d in risky))
+        chosen = [d for d in chosen if d not in risky]
+    if not chosen:
+        return []
+    if remote and not confirm(f"Install {len(chosen)} skill(s) into the bank?", yes):
+        say("nothing installed")
+        return []
+    added = []
+    for d in chosen:
+        n = register(c, d, lane, link=link, force=force, source=source_of(d), ref=ref)
+        if n:
+            added.append(n)
+    return added
+
+
 # ---------------------------------------------------------------------------------------------------- commands
 
 def cmd_init(a):
@@ -414,7 +908,11 @@ def cmd_init(a):
     for d in (BANK, COLD, GATED, LANES_DIR):
         d.mkdir(parents=True, exist_ok=True)
     if not CONFIG.exists():
-        CONFIG.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+        cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+        for name, info in KNOWN_AGENTS.items():
+            if name not in cfg["harness_dirs"] and not info.get("manual") and Path(info["global"]).expanduser().is_dir():
+                cfg["harness_dirs"][name] = info["global"]
+        CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
         say(f"[write] {CONFIG}")
     cfg = config()
     c = db()
@@ -424,7 +922,7 @@ def cmd_init(a):
     found = harness_dirs(cfg)
     say(f"skills-gate {VERSION} ready at {HOME}")
     say("harness folders: " + (", ".join(f"{k}={v}" for k, v in found.items()) or "none found"))
-    say("next: `skills-gate gate --dry-run` to see what would move behind the gate")
+    say("next: `skills-gate gate --dry-run` to see what would move behind the gate; `skills-gate agents` for more")
 
 
 def cmd_add(a):
@@ -433,52 +931,33 @@ def cmd_add(a):
     src = a.source
     added = []
     if Path(src).expanduser().exists():
-        for d in find_skill_dirs(Path(src)):
-            if a.only and d.name not in a.only and frontmatter(d / "SKILL.md").get("name") not in a.only:
-                continue
-            n = register(c, d, a.lane, link=a.link, force=a.force)
-            if n:
-                added.append(n)
+        dirs = find_skill_dirs(Path(src))
+        if not dirs:
+            die(f"no SKILL.md found in {src}")
+        added = install_dirs(c, dirs, remote=False, yes=True, allow_risky=True, lane=a.lane, link=a.link,
+                             force=a.force, only=a.only)
     else:
-        url, sub, ref = parse_git(src)
+        catalog_tables(c)
+        bad = c.execute("select * from market where status='fail' and (id=? or repo||'/'||path=? or"
+                        " (path='' and repo=?))", (src, src, src)).fetchone()
+        if bad and not a.allow_risky:
+            die(f"{src} failed catalog validation: {'; '.join(json.loads(bad['reasons'])[:4])}."
+                f" Read it (`skills-gate market show {bad['id']}`); --allow-risky installs it anyway")
+        url, sub, ref, only = parse_git(src)
         with tempfile.TemporaryDirectory(prefix="skills-gate-") as td:
-            cmd = ["git", "clone", "-q", "--depth", "1"] + (["--branch", ref] if ref else []) + [url, td + "/r"]
-            if subprocess.run(cmd).returncode != 0:
-                die(f"git clone failed for {url}")
-            root = Path(td) / "r" / sub if sub else Path(td) / "r"
+            repo, commit = fetch_repo(url, ref, Path(td))
+            root = repo / sub if sub else repo
             if not root.exists():
                 die(f"{sub} not found in {url}")
-            commit = subprocess.run(["git", "-C", td + "/r", "rev-parse", "--short", "HEAD"], capture_output=True,
-                                    text=True).stdout.strip()
             dirs = find_skill_dirs(root)
             if not dirs:
                 die(f"no SKILL.md found in {src}")
-            for d in dirs:
-                if a.only and d.name not in a.only and frontmatter(d / "SKILL.md").get("name") not in a.only:
-                    continue
-                rel = d.relative_to(Path(td) / "r")
-                n = register(c, d, a.lane, force=a.force, source=f"{url}#{rel}@{commit}")
-                if n:
-                    added.append(n)
+            added = install_dirs(c, dirs, remote=True, yes=a.yes, allow_risky=a.allow_risky, lane=a.lane,
+                                 force=a.force, only=(a.only or []) + only, ref=ref,
+                                 source_of=lambda d: f"{url}#{d.relative_to(repo) or '.'}@{commit}")
     write_registry(c, cfg)
     c.commit()
     say(f"{len(added)} skill(s) in the bank from {src}")
-
-
-def parse_git(src: str) -> tuple[str, str, str]:
-    """owner/repo[/sub/path][@ref] or a git URL (https://github.com/o/r/tree/<ref>/<sub> understood)."""
-    ref = ""
-    if "@" in src and not src.startswith("git@"):
-        src, ref = src.rsplit("@", 1)
-    m = re.match(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?(?:/tree/([^/]+)(?:/(.*))?)?/?$", src)
-    if m:
-        return f"https://github.com/{m.group(1)}/{m.group(2)}.git", m.group(4) or "", ref or (m.group(3) or "")
-    if re.match(r"^(https?://|git@|ssh://)", src):
-        return src, "", ref
-    parts = src.strip("/").split("/")
-    if len(parts) >= 2 and all(re.match(r"^[A-Za-z0-9._-]+$", p) for p in parts):
-        return f"https://github.com/{parts[0]}/{parts[1]}.git", "/".join(parts[2:]), ref
-    die(f"not a folder, git URL or owner/repo[/path]: {src}")
 
 
 def cmd_adopt(a):
@@ -488,8 +967,7 @@ def cmd_adopt(a):
     n = 0
     for root in a.paths:
         for d in find_skill_dirs(Path(root), depth=2):
-            entry = Path(root).expanduser() / d.name
-            linked = entry.is_symlink()
+            linked = d.is_symlink()
             if register(c, d.resolve() if linked else d, a.lane, link=linked and not a.copy, force=a.force):
                 n += 1
     write_registry(c, cfg)
@@ -499,6 +977,10 @@ def cmd_adopt(a):
 
 def gated_manifest() -> Path:
     return GATED / "manifest.json"
+
+
+def is_global_toggle(c, name: str) -> bool:
+    return bool(c.execute("select 1 from toggles where skill=? and scope='global'", (name,)).fetchone())
 
 
 def cmd_gate(a):
@@ -515,23 +997,21 @@ def cmd_gate(a):
                 continue
             if name in keep:
                 # always-on: stays where it is, and is shared with every other harness through the bank
-                if not a.dry_run and name != GATE_NAME and not (bank_path(name).exists() or bank_path(name).is_symlink()):
+                if not a.dry_run and name != GATE_NAME and not in_bank(name):
                     register(c, entry.resolve(), link=True)
                 continue
-            if (entry.is_symlink() and Path(os.readlink(entry)) == bank_path(name)
-                    and c.execute("select 1 from toggles where skill=? and scope='global'", (name,)).fetchone()):
+            if links_to(entry, name) and is_global_toggle(c, name):
                 continue  # switched on globally through the gate: legitimate
             if a.dry_run:
                 say(f"[dry]   {harness}: {name}{' (link)' if entry.is_symlink() else ''}")
                 moved += 1
                 continue
-            if not (bank_path(name).exists() or bank_path(name).is_symlink()):
+            if not in_bank(name):
                 linked = entry.is_symlink()
                 register(c, entry.resolve() if linked else entry, link=linked)
             backup = GATED / harness / name
             backup.parent.mkdir(parents=True, exist_ok=True)
-            if backup.exists() or backup.is_symlink():
-                shutil.rmtree(backup) if backup.is_dir() and not backup.is_symlink() else backup.unlink()
+            rm(backup)
             if entry.is_symlink():
                 backup.symlink_to(os.readlink(entry))
                 entry.unlink()
@@ -612,43 +1092,163 @@ def cmd_set_lane(a):
     c.commit()
 
 
-def score(r, terms) -> int:
-    name, desc, lane = r["name"].lower(), r["description"].lower(), r["lane"].lower()
-    s = 0
-    for t in terms:
-        s += 6 * (t in name) + 3 * (t in lane) + 2 * desc.count(t)
-    return s + min(r["uses"], 5) if s else 0
-
-
 def cmd_search(a):
-    terms = [t for t in re.findall(r"[a-z0-9][a-z0-9+.#-]*", a.query.lower()) if len(t) > 1]
+    c = db()
+    cfg = config()
     if not a.market:
-        c = db()
-        hits = sorted(((score(r, terms), r) for r in c.execute("select * from skills")), key=lambda x: -x[0])
-        hits = [(s, r) for s, r in hits if s > 0][: a.limit]
+        hits = Index(c.execute("select * from skills").fetchall()).rank(a.query, a.limit)
         if a.json:
-            say(json.dumps([{"name": r["name"], "lane": r["lane"], "description": r["description"],
-                             "tokens": r["tokens"], "uses": r["uses"]} for _, r in hits], indent=1))
+            say(json.dumps([{"name": r["name"], "lane": r["lane"], "score": s, "description": r["description"],
+                             "tokens": r["tokens"], "uses": r["uses"], "risk": r["risk"]} for s, r in hits], indent=1))
             return
-        for _, r in hits:
-            say(f"{r['name']:<34} [{r['lane']}] {r['description'][:110]}")
+        for s, r in hits:
+            say(f"{r['name']:<34} [{r['lane']}] {short(r['description'], 110)}")
         if not hits:
             say("no bank match; try `--market` to search online")
         return
-    results = market_search(a.query, a.limit)
+    catalog_tables(c)
+    use_catalog = not a.live and c.execute("select 1 from market where validated_at is not null limit 1").fetchone()
+    results = catalog_search(c, a.query, a.limit, show_all=a.all) if use_catalog else []
+    if use_catalog and not results:
+        warn("no validated catalog match yet; asking the marketplaces live")
+        use_catalog = False
+    if not use_catalog:
+        results = market_search(c, cfg, a.query, a.limit, offline=a.offline)
+    c.commit()
     if a.json:
         say(json.dumps(results, indent=1))
         return
     for r in results:
-        say(f"{r['install']:<60} {r['stars']:>6}*  {r['about'][:70]}")
+        pop = f"{r['popularity']}{'i' if r['kind'] == 'installs' else '*'}"
+        mark = "  (in bank)" if r["in_bank"] else ""
+        say(f"{r['install']:<58} {pop:>8} {r['via']:<9} {short(r['about'], 60)}{mark}")
     if not results:
         say("no market results")
     else:
-        say("\ninstall one with: skills-gate add <install>   (only on the user's yes)")
+        say(("\n(* = GitHub stars; from the validated catalog, --live asks the sources now)" if use_catalog else
+             "\n(i = installs on skills.sh, * = GitHub stars)") +
+            "  install with: skills-gate add <install> --yes  (only on the user's yes)")
 
 
-def market_search(query: str, limit: int) -> list[dict]:
-    """GitHub code search for SKILL.md files (needs `gh` logged in), falling back to repository search."""
+def cmd_suggest(a):
+    """Rank the bank for a task. With --hook, read a Claude Code UserPromptSubmit payload and print context."""
+    if a.hook:
+        try:
+            hook_suggest()
+        except Exception:  # a prompt hook must never block or break the session
+            pass
+        return
+    if not a.task.strip():
+        die('suggest needs the task: skills-gate suggest "<what you are about to do>"')
+    c = db()
+    cfg = config()
+    hits_rows = c.execute("select * from skills").fetchall()
+    hits = Index(hits_rows).rank(a.task, 10)
+    picks = hits[: a.limit] if a.all else confident(hits, cfg, n_docs=len(hits_rows))[: a.limit]
+    if a.json:
+        say(json.dumps([{"name": r["name"], "lane": r["lane"], "score": s, "description": r["description"]}
+                        for s, r in picks], indent=1))
+        return
+    for s, r in picks:
+        say(f"{r['name']:<30} {s:>6}  [{r['lane']}] {short(r['description'], 100)}")
+    if not picks:
+        say("no confident match" + (f" (best: {hits[0][1]['name']} {hits[0][0]}; --all shows it)" if hits else ""))
+
+
+def hook_suggest():
+    payload = json.loads(sys.stdin.read() or "{}")
+    prompt = str(payload.get("prompt") or payload.get("user_prompt") or "").strip()
+    cfg = config()
+    if len(prompt) < cfg["suggest"]["min_prompt"] or prompt.startswith(("/", "!", "<")):
+        return  # slash commands, shell escapes, harness-injected messages
+    c = db(timeout=2)  # the hook has 10 s; a tidy holding the lock must not eat them
+    exclude = set(always_on(cfg))
+    scope = str(project_root(Path(payload["cwd"]))) if payload.get("cwd") else None
+    for r in c.execute("select skill from toggles where scope in ('global', ?)", (scope or "",)):
+        exclude.add(r[0])
+    rows = c.execute("select * from skills").fetchall()
+    picks = confident(Index(rows).rank(prompt[:4000], 10), cfg, exclude, n_docs=len(rows))
+    if not picks:
+        return
+    lines = ["skills-gate: banked skills that match this request. If one fits, load it with "
+             "`skills-gate use <name>` before you start; ignore them if they do not fit."]
+    for s, r in picks:
+        lines.append(f"- {r['name']} [{r['lane']}]: {short(r['description'], 150)}")
+    say("\n".join(lines))
+    event(c, None, "suggest", json.dumps({"skills": [r["name"] for _, r in picks],
+                                         "session": payload.get("session_id", "")}))
+    c.commit()
+
+
+def cmd_hook(a):
+    """Print, install or remove the Claude Code prompt hook that runs `suggest` on every prompt."""
+    exe = shutil.which("skills-gate") or str(Path(sys.argv[0]).resolve())
+    entry = {"hooks": [{"type": "command", "command": f"{exe} suggest --hook", "timeout": 10}]}
+    path = Path(a.settings).expanduser()
+    if not (a.write or a.remove):
+        say(json.dumps({"hooks": {"UserPromptSubmit": [entry]}}, indent=2))
+        say(f"\nmerge into {path}, or run `skills-gate hook --write`")
+        return
+    data = json.loads(path.read_text()) if path.is_file() else {}
+    groups = data.setdefault("hooks", {}).setdefault("UserPromptSubmit", [])
+    ours = [g for g in groups if any("skills-gate" in h.get("command", "") and "suggest" in h.get("command", "")
+                                     for h in g.get("hooks", []))]
+    if a.write and ours:
+        say(f"[have]  the suggest hook is already in {path}")
+        return
+    if a.remove and not ours:
+        say(f"[none]  no suggest hook in {path}")
+        return
+    if path.is_file():
+        shutil.copy2(path, path.with_name(path.name + ".skills-gate.bak"))
+    if a.write:
+        groups.append(entry)
+    else:
+        data["hooks"]["UserPromptSubmit"] = [g for g in groups if g not in ours]
+        if not data["hooks"]["UserPromptSubmit"]:
+            del data["hooks"]["UserPromptSubmit"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    say(f"[hook]  {'added to' if a.write else 'removed from'} {path} (backup: {path.name}.skills-gate.bak)")
+
+
+# ---------------------------------------------------------------------------------------------------- market
+
+def http_json(url: str, timeout=20):
+    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": f"skills-gate/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def m_skills_sh(query: str, limit: int) -> list[dict]:
+    d = http_json("https://skills.sh/api/search?q=" + urllib.parse.quote(query))
+    out = []
+    for s in (d.get("skills") or [])[: limit * 2]:
+        if not s.get("source") or not s.get("skillId"):
+            continue
+        out.append({"install": f"{s['source']}:{s['skillId']}", "name": s.get("name") or s["skillId"],
+                    "repo": s["source"], "popularity": int(s.get("installs") or 0), "kind": "installs",
+                    "about": s.get("description") or f"skills.sh/{s.get('id', '')}"})
+    return out
+
+
+def m_gh_skill(query: str, limit: int) -> list[dict]:
+    if not shutil.which("gh"):
+        return m_github(query, limit)
+    r = subprocess.run(["gh", "skill", "search", query, "--limit", str(limit * 2), "--json",
+                        "description,path,repo,skillName,stars"], capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return m_github(query, limit)
+    out = []
+    for s in json.loads(r.stdout or "[]"):
+        sub = str(Path(s["path"]).parent)
+        out.append({"install": s["repo"] + ("" if sub == "." else "/" + sub), "name": s.get("skillName", ""),
+                    "repo": s["repo"], "popularity": int(s.get("stars") or 0), "kind": "stars",
+                    "about": s.get("description") or s["path"]})
+    return out
+
+
+def m_github(query: str, limit: int) -> list[dict]:
     out, seen = [], set()
     if shutil.which("gh"):
         r = subprocess.run(["gh", "search", "code", query, "--filename", "SKILL.md", "--limit", str(limit * 3),
@@ -657,38 +1257,403 @@ def market_search(query: str, limit: int) -> list[dict]:
             for hit in json.loads(r.stdout or "[]"):
                 repo = hit["repository"]["nameWithOwner"]
                 sub = str(Path(hit["path"]).parent)
-                key = f"{repo}/{sub}" if sub != "." else repo
-                if key in seen:
-                    continue
-                seen.add(key)
-                out.append({"install": key, "repo": repo, "stars": repo_stars(repo), "about": hit["path"]})
-                if len(out) >= limit:
-                    break
-            terms = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if len(t) > 2]
-            return sorted(out, key=lambda x: (-sum(t in x["install"].lower() for t in terms), -x["stars"]))
+                key = repo + ("" if sub == "." else "/" + sub)
+                if key not in seen:
+                    seen.add(key)
+                    out.append({"install": key, "name": Path(sub).name if sub != "." else repo.split("/")[1],
+                                "repo": repo, "popularity": 0, "kind": "stars", "about": hit["path"]})
+            stars = repo_stars({o["repo"] for o in out})
+            for o in out:
+                o["popularity"] = stars.get(o["repo"], 0)
+            return out
     q = urllib.parse.quote(f"{query} SKILL.md in:readme,description")
-    req = urllib.request.Request(f"https://api.github.com/search/repositories?q={q}&sort=stars&per_page={limit}",
-                                 headers={"Accept": "application/vnd.github+json", "User-Agent": "skills-gate"})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            for it in json.load(resp).get("items", []):
-                out.append({"install": it["full_name"], "repo": it["full_name"], "stars": it["stargazers_count"],
-                            "about": (it.get("description") or "")})
-    except OSError as e:
-        say(f"market search failed: {e}")
+    for it in http_json(f"https://api.github.com/search/repositories?q={q}&sort=stars&per_page={limit}").get("items", []):
+        out.append({"install": it["full_name"], "name": it["name"], "repo": it["full_name"],
+                    "popularity": it["stargazers_count"], "kind": "stars", "about": it.get("description") or ""})
     return out
 
 
-_stars: dict[str, int] = {}
+def repo_stars(repos: set[str]) -> dict[str, int]:
+    """Star counts for many repos in one GraphQL call."""
+    repos = sorted(r for r in repos if re.match(r"^[\w.-]+/[\w.-]+$", r))
+    if not repos:
+        return {}
+    parts = [f'r{i}: repository(owner: "{r.split("/")[0]}", name: "{r.split("/")[1]}") {{ nameWithOwner stargazerCount }}'
+             for i, r in enumerate(repos[:50])]
+    r = subprocess.run(["gh", "api", "graphql", "-f", "query={ " + " ".join(parts) + " }"], capture_output=True,
+                       text=True, timeout=30)
+    try:
+        data = json.loads(r.stdout).get("data") or {}
+    except ValueError:
+        return {}
+    return {v["nameWithOwner"]: v["stargazerCount"] for v in data.values() if v}
 
 
-def repo_stars(repo: str) -> int:
-    if repo not in _stars:
-        r = subprocess.run(["gh", "api", f"repos/{repo}", "--jq", ".stargazers_count"], capture_output=True,
-                           text=True, timeout=20)
-        _stars[repo] = int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else 0
-    return _stars[repo]
+MARKETS = {"skills.sh": m_skills_sh, "gh-skill": m_gh_skill, "github": m_github}
 
+
+def market_search(c, cfg, query: str, limit: int, offline: bool = False) -> list[dict]:
+    """Every configured marketplace, cached per query for market_ttl_hours; --offline reads only the cache."""
+    ttl = int(cfg.get("market_ttl_hours", 24)) * 3600
+    results = []
+    for src in cfg.get("marketplace", []):
+        fn = MARKETS.get(src)
+        if not fn:
+            warn(f"unknown marketplace {src!r}; known: {', '.join(MARKETS)}")
+            continue
+        key = f"{src}:{query.lower().strip()}"
+        row = c.execute("select at, body from market_cache where key=?", (key,)).fetchone()
+        if row and (offline or now() - row["at"] < ttl):
+            items = json.loads(row["body"])
+        elif offline:
+            items = []
+        else:
+            try:
+                items = fn(query, limit)
+                c.execute("insert or replace into market_cache values (?,?,?)", (key, now(), json.dumps(items)))
+            except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+                warn(f"market {src}: {e}")
+                items = json.loads(row["body"]) if row else []
+        for it in items:
+            it["via"] = src
+        results += items
+    if offline:  # also match anything cached under other queries
+        terms = toks(query)
+        for row in c.execute("select body from market_cache"):
+            for it in json.loads(row["body"]):
+                hay = f"{it['install']} {it['name']} {it['about']}".lower()
+                if terms and all(t in hay for t in terms):
+                    results.append(dict(it, via=it.get("via", "cache")))
+    merged: dict[str, dict] = {}
+    for it in results:
+        k = it["install"].lower()
+        if re.search(r"/(e2e|fixtures?|tests?|__tests__|examples?/test)(/|$)", k):
+            continue  # test fixtures that happen to hold a SKILL.md
+        if k in merged:
+            merged[k]["via"] = ",".join(sorted(set(merged[k]["via"].split(",")) | {it["via"]}))
+            merged[k]["popularity"] = max(merged[k]["popularity"], it["popularity"])
+        else:
+            merged[k] = dict(it)
+    names = {r[0] for r in c.execute("select name from skills")}
+    terms = toks(query)
+    out = []
+    for it in merged.values():
+        it["in_bank"] = it["name"] in names
+        it["match"] = sum(t in (it["name"] + " " + it["install"]).lower() for t in terms)
+        out.append(it)
+    out.sort(key=lambda x: (-x["match"], -x["popularity"]))
+    return out[:limit]
+
+
+# ---------------------------------------------------------------------------------------------------- catalog
+# The marketplace as a local catalog: gathered daily from the skills.sh sitemap and any repos you list, each skill
+# validated from its real SKILL.md before it is offered. Search runs offline against it.
+
+SITEMAPS = ["https://www.skills.sh/sitemap-skills-1.xml", "https://www.skills.sh/sitemap-skills-2.xml"]
+BINARY_EXT = {".exe", ".dll", ".so", ".dylib", ".bin", ".msi", ".app", ".jar", ".pyc", ".o", ".a"}
+
+
+def gh_api(path: str):
+    """GitHub REST through `gh` (authenticated, 5000/h) or urllib with $GITHUB_TOKEN (60/h without one)."""
+    if shutil.which("gh"):
+        r = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise OSError(short(r.stderr or r.stdout, 160))
+        return json.loads(r.stdout)
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": f"skills-gate/{VERSION}"}
+    if os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+    req = urllib.request.Request("https://api.github.com/" + path.lstrip("/"), headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.load(resp)
+
+
+def http_text(url: str, timeout=30, limit=2_000_000) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": f"skills-gate/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(limit).decode("utf-8", errors="replace")
+
+
+def catalog_tables(c):
+    c.executescript("""
+    create table if not exists market (
+        id text primary key, repo text not null, skill text not null, path text not null default '',
+        name text not null default '', description text not null default '', origin text not null default '',
+        rank integer, stars integer not null default 0, license text not null default '',
+        blob text not null default '', status text not null default 'new', reasons text not null default '[]',
+        first_seen integer not null, last_seen integer not null, validated_at integer, updated_at integer);
+    create index if not exists market_status on market (status, rank);
+    create table if not exists market_names (blob text primary key, name text not null);
+    create table if not exists market_repos (
+        repo text primary key, branch text, stars integer, license text, archived integer, pushed_at text,
+        tree text, truncated integer, checked_at integer, error text);
+    """)
+
+
+def market_gather(c, cfg) -> tuple[int, int]:
+    """Every skill id the sources publish. New ids get first_seen=now; ids already known get last_seen=now."""
+    t, seen, new = now(), 0, 0
+    ids: list[tuple[str, str, str, int | None]] = []  # (repo, skill, origin, rank)
+    if "skills.sh" in cfg["market"]["sources"]:
+        pos = 0
+        for url in SITEMAPS:
+            try:
+                xml = http_text(url, limit=20_000_000)
+            except OSError as e:
+                warn(f"catalog: {url}: {e}")
+                continue
+            for loc in re.findall(r"<loc>https://(?:www\.)?skills\.sh/([^<]+)</loc>", xml):
+                parts = urllib.parse.unquote(loc).strip("/").split("/")
+                if len(parts) == 3 and all(re.match(r"^[A-Za-z0-9._-]+$", p) for p in parts):
+                    pos += 1
+                    ids.append((f"{parts[0]}/{parts[1]}", parts[2], "skills.sh", pos))
+    for repo in cfg["market"].get("repos", []):
+        try:
+            for path in repo_tree_skills(c, repo, force=True):
+                ids.append((repo, Path(path).parent.name or repo.split("/")[1], "repo", None))
+        except OSError as e:
+            warn(f"catalog: {repo}: {e}")
+    for repo, skill, origin, rank in ids:
+        sid = f"{repo}:{skill}"
+        cur = c.execute("update market set last_seen=?, rank=coalesce(?, rank) where id=?", (t, rank, sid))
+        if not cur.rowcount:
+            c.execute("insert into market (id, repo, skill, origin, rank, first_seen, last_seen) values (?,?,?,?,?,?,?)",
+                      (sid, repo, skill, origin, rank, t, t))
+            new += 1
+        seen += 1
+    if seen:
+        meta_set(c, "market_gathered_at", t)
+    return seen, new
+
+
+def repo_meta(c, repo: str, force=False) -> sqlite3.Row:
+    r = c.execute("select * from market_repos where repo=?", (repo,)).fetchone()
+    if r and not force and r["checked_at"] and now() - r["checked_at"] < 20 * 3600:
+        return r
+    try:
+        m = gh_api(f"repos/{repo}")
+        tree = gh_api(f"repos/{repo}/git/trees/{urllib.parse.quote(m['default_branch'])}?recursive=1")
+        c.execute("insert or replace into market_repos values (?,?,?,?,?,?,?,?,?,?)",
+                  (repo, m["default_branch"], m.get("stargazers_count", 0), (m.get("license") or {}).get("spdx_id") or "",
+                   int(bool(m.get("archived"))), m.get("pushed_at") or "",
+                   json.dumps([[x["path"], x.get("size", 0), x.get("sha", "")] for x in tree.get("tree", [])
+                               if x.get("type") == "blob"]), int(bool(tree.get("truncated"))), now(), ""))
+    except (OSError, ValueError, KeyError) as e:
+        c.execute("insert or replace into market_repos (repo, checked_at, error) values (?,?,?)", (repo, now(), str(e)))
+    return c.execute("select * from market_repos where repo=?", (repo,)).fetchone()
+
+
+def repo_tree_skills(c, repo: str, force=False) -> list[str]:
+    r = repo_meta(c, repo, force)
+    if r["error"]:
+        raise OSError(r["error"])
+    return [p for p, _, _ in json.loads(r["tree"] or "[]") if p == "SKILL.md" or p.endswith("/SKILL.md")]
+
+
+def mark_failed(c, row, reasons: list[str]) -> tuple[str, list[str]]:
+    c.execute("update market set status='fail', reasons=?, validated_at=? where id=?",
+              (json.dumps(reasons), now(), row["id"]))
+    return "fail", reasons
+
+
+def validate_entry(c, row, force: bool = False) -> tuple[str, list[str]]:
+    """Find the skill in its repo, read its SKILL.md and judge it: ok, warn or fail, with the reasons."""
+    meta = repo_meta(c, row["repo"], force)
+    if meta["error"]:
+        return mark_failed(c, row, [f"repo unreachable: {short(meta['error'], 100)}"])
+    files = json.loads(meta["tree"] or "[]")
+    mds = [(p, s, sha) for p, s, sha in files if p == "SKILL.md" or p.endswith("/SKILL.md")]
+    pick = [m for m in mds if Path(m[0]).parent.name == row["skill"]] or \
+           [m for m in mds if len(mds) == 1 or m[0] == "SKILL.md" and row["skill"] == row["repo"].split("/")[1]] or \
+           [m for m in mds if front_name(c, row["repo"], meta["branch"], m) == row["skill"]]
+    if not pick:
+        why = "tree truncated (huge repo)" if meta["truncated"] else "listed, but not in the repo (renamed or removed upstream)"
+        return mark_failed(c, row, [f"not found: {why}"])
+    path, size, blob = min(pick, key=lambda m: len(m[0]))
+    reasons, status = [], "ok"
+    try:
+        text = http_text(f"https://raw.githubusercontent.com/{row['repo']}/{meta['branch']}/{urllib.parse.quote(path)}")
+    except OSError as e:
+        return mark_failed(c, row, [f"SKILL.md unreadable: {e}"])
+    with tempfile.TemporaryDirectory(prefix="skills-gate-") as td:
+        md = Path(td) / "SKILL.md"
+        md.write_text(text)
+        fm = frontmatter(md)
+        findings = scan_tree(Path(td))
+    name, desc = fm.get("name", ""), re.sub(r"\s+", " ", fm.get("description", "")).strip()
+    body = re.sub(r"^﻿?---\s*\n.*?\n---\s*\n", "", text, count=1, flags=re.S)
+
+    def flag(level, why):  # low findings are notes; medium makes it warn, high makes it fail
+        nonlocal status
+        reasons.append(why)
+        if level == "high":
+            status = "fail"
+        elif level == "medium" and status == "ok":
+            status = "warn"
+
+    if not name or not desc:
+        flag("high", "front matter lacks name or description")
+    elif not NAME_RX.match(name):
+        flag("high", f"unusable name {name!r}")
+    if name and name != row["skill"]:
+        flag("low", f"name {name!r} differs from listing {row['skill']!r}")
+    if desc and len(desc) < 20:
+        flag("medium", "description under 20 characters")
+    if len(desc) > 1024:
+        flag("low", "description over 1024 characters")
+    if len(body.strip()) < 200:
+        flag("medium", "playbook under 200 characters")
+    if size > 200_000:
+        flag("medium", f"SKILL.md is {size // 1000} kB")
+    for f in findings:
+        flag(f["sev"], f"{f['rule']}: line {f['line']}")
+    folder = str(Path(path).parent)
+    sibs = [(p, s) for p, s, _ in files if folder == "." or p.startswith(folder + "/")]
+    if folder == ".":
+        sibs = [(p, s) for p, s in sibs if "/" not in p]
+    scripts = [p for p, _ in sibs if Path(p).suffix.lower() in SCRIPT_EXT]
+    bins = [p for p, _ in sibs if Path(p).suffix.lower() in BINARY_EXT]
+    if bins:
+        flag("medium", f"ships binaries: {', '.join(Path(b).name for b in bins[:3])}")
+    if scripts:
+        reasons.append(f"{len(scripts)} script(s); the install scan reads them")
+    if sum(s for _, s in sibs) > 20_000_000:
+        flag("medium", "folder over 20 MB")
+    if meta["archived"]:
+        flag("medium", "repo archived")
+    if not meta["license"]:
+        flag("low", "repo has no licence")
+    changed = row["blob"] and row["blob"] != blob
+    c.execute("update market set path=?, name=?, description=?, stars=?, license=?, blob=?, status=?, reasons=?,"
+              " validated_at=?, updated_at=case when ? then ? else updated_at end where id=?",
+              (folder if folder != "." else "", name or row["skill"], desc, meta["stars"] or 0, meta["license"] or "",
+               blob, status, json.dumps(reasons), now(), int(bool(changed)), now(), row["id"]))
+    return status, reasons
+
+
+def front_name(c, repo: str, branch: str, md) -> str:
+    """The front-matter name of one SKILL.md in a repo tree, cached by blob (raw fetches cost no API quota)."""
+    path, _, blob = md
+    hit = c.execute("select name from market_names where blob=?", (blob,)).fetchone()
+    if hit:
+        return hit[0]
+    try:
+        text = http_text(f"https://raw.githubusercontent.com/{repo}/{branch}/{urllib.parse.quote(path)}", limit=20000)
+    except OSError:
+        return ""
+    m = re.search(r"^name:\s*['\"]?([^'\"\n]+)", text.split("\n---", 1)[0], re.M)
+    name = m.group(1).strip() if m else ""
+    c.execute("insert or replace into market_names values (?,?)", (blob, name))
+    return name
+
+
+def market_install_id(row) -> str:
+    if row["path"] or row["validated_at"]:
+        return row["repo"] + (f"/{row['path']}" if row["path"] else "")
+    return f"{row['repo']}:{row['skill']}"
+
+
+def cmd_market(a):
+    c = db()
+    cfg = config()
+    catalog_tables(c)
+    if a.action == "refresh":
+        seen, new = (0, 0) if a.no_gather else market_gather(c, cfg)
+        c.commit()
+        budget = a.budget if a.budget is not None else int(cfg["market"]["budget"])
+        stale = now() - int(cfg["market"]["revalidate_days"]) * DAY
+        todo = c.execute("select * from market where validated_at is null order by rank is null, rank, first_seen"
+                         " limit ?", (budget,)).fetchall()
+        if len(todo) < budget:
+            todo += c.execute("select * from market where validated_at < ? order by validated_at limit ?",
+                              (stale, budget - len(todo))).fetchall()
+        tally = {"ok": 0, "warn": 0, "fail": 0}
+        for i, row in enumerate(todo, 1):
+            try:
+                st, _ = validate_entry(c, row)
+            except (OSError, ValueError) as e:
+                st = "fail"
+                c.execute("update market set status='fail', reasons=?, validated_at=? where id=?",
+                          (json.dumps([f"error: {short(str(e), 120)}"]), now(), row["id"]))
+            tally[st] += 1
+            if i % 25 == 0:
+                c.commit()
+        meta_set(c, "market_refreshed_at", now())
+        c.commit()
+        total = c.execute("select count(*) from market").fetchone()[0]
+        done = c.execute("select count(*) from market where validated_at is not null").fetchone()[0]
+        say(f"catalog: {seen} listed, {new} new; validated {len(todo)} ({tally['ok']} ok, {tally['warn']} warn,"
+            f" {tally['fail']} fail); {done} of {total} validated so far")
+        return
+    if a.action == "validate":
+        for sid in a.ids:
+            row = c.execute("select * from market where id=? or ?=repo||'/'||path", (sid, sid)).fetchone()
+            if not row:
+                repo, _, skill = sid.partition(":")
+                if not skill:
+                    die(f"{sid}: give owner/repo:skill")
+                c.execute("insert or ignore into market (id, repo, skill, origin, first_seen, last_seen)"
+                          " values (?,?,?,?,?,?)", (sid, repo, skill, "manual", now(), now()))
+                row = c.execute("select * from market where id=?", (sid,)).fetchone()
+            st, why = validate_entry(c, row, force=True)
+            say(f"{sid}: {st}" + "".join(f"\n  - {w}" for w in why))
+        c.commit()
+        return
+    if a.action == "show":
+        row = c.execute("select * from market where id=? or ?=repo||'/'||path", (a.ids[0], a.ids[0])).fetchone() \
+            if a.ids else None
+        if not row:
+            die("no such catalog entry (ids look like owner/repo:skill)")
+        for k in ("id", "name", "description", "origin", "rank", "stars", "license", "status"):
+            say(f"{k:<12} {row[k]}")
+        say(f"{'install':<12} skills-gate add {market_install_id(row)} --yes")
+        say(f"{'first seen':<12} {day(row['first_seen'])}   validated {day(row['validated_at'])}"
+            f"   updated {day(row['updated_at'])}")
+        for w in json.loads(row["reasons"]):
+            say(f"  - {w}")
+        return
+    if a.action == "new":
+        since = now() - a.days * DAY
+        rows = c.execute("select * from market where (first_seen>=? or updated_at>=?) and status in (?,?,?)"
+                         " order by status='ok' desc, rank is null, rank limit ?",
+                         (since, since, "ok", "warn", "fail" if a.all else "ok", a.limit)).fetchall()
+        for r in rows:
+            tag = "updated" if r["updated_at"] and r["updated_at"] >= since and r["first_seen"] < since else "new"
+            say(f"{r['id']:<56} {r['status']:<5} {tag:<8} {short(r['description'], 60)}")
+        pending = c.execute("select count(*) from market where first_seen>=? and validated_at is null",
+                            (since,)).fetchone()[0]
+        say(f"{len(rows)} shown; {pending} new not validated yet (`market refresh` works through them)")
+        return
+    # stats
+    total = c.execute("select count(*) from market").fetchone()[0]
+    say(f"catalog: {total} skills, gathered {day(meta_get(c, 'market_gathered_at'))},"
+        f" refreshed {day(meta_get(c, 'market_refreshed_at'))}")
+    for r in c.execute("select status, count(*) n from market group by status order by n desc"):
+        say(f"  {r['status']:<6} {r['n']}")
+    say(f"  repos checked: {c.execute('select count(*) from market_repos').fetchone()[0]}")
+    week = c.execute("select count(*) from market where first_seen>=?", (now() - 7 * DAY,)).fetchone()[0]
+    say(f"  new this week: {week}")
+
+
+def catalog_search(c, query: str, limit: int, show_all: bool = False) -> list[dict]:
+    catalog_tables(c)
+    statuses = ("ok", "warn", "fail") if show_all else ("ok", "warn")
+    rows = c.execute(f"select * from market where status in ({','.join('?' * len(statuses))})", statuses).fetchall()
+    docs = [{"name": r["name"] or r["skill"], "description": r["description"], "lane": r["repo"], "keywords": "",
+             "uses": 0, "_row": r} for r in rows]
+    names = {x[0] for x in c.execute("select name from skills")}
+    out = []
+    for s, d in Index(docs).rank(query, limit * 4):
+        r = d["_row"]
+        pop = 0.6 * math.log1p(r["stars"]) + (1.5 if r["rank"] and r["rank"] <= 1000 else 0)
+        out.append({"install": market_install_id(r), "name": d["name"], "repo": r["repo"], "popularity": r["stars"],
+                    "kind": "stars", "about": r["description"], "via": f"catalog:{r['status']}",
+                    "in_bank": d["name"] in names, "score": round(s + pop, 2)})
+    out.sort(key=lambda x: -x["score"])
+    return out[:limit]
+
+
+# ---------------------------------------------------------------------------------------------------- use / show / toggles
 
 def cmd_use(a):
     c = db()
@@ -701,7 +1666,7 @@ def cmd_use(a):
     c.commit()
     say(f"<!-- skills-gate use {r['name']} | folder: {p} | lane: {r['lane']} -->")
     sys.stdout.write(md.read_text(encoding="utf-8", errors="replace"))
-    extra = sorted(str(f.relative_to(p)) for f in p.rglob("*") if f.is_file() and f.name != "SKILL.md")
+    extra = sorted(str(rel) for f, rel in files_of(p) if f.name != "SKILL.md")
     if extra:
         say(f"\n<!-- files in {p}: {', '.join(extra[:40])}{' ...' if len(extra) > 40 else ''} -->")
 
@@ -710,30 +1675,70 @@ def cmd_show(a):
     c = db()
     r = get(c, a.skill)
     toggles = c.execute("select scope, on_at from toggles where skill=?", (r["name"],)).fetchall()
-    info = dict(r) | {"path": str(bank_path(r["name"])), "on": [t["scope"] for t in toggles]}
+    refs = [x[0] for x in c.execute("select path from refs where skill=? order by path", (r["name"],))]
+    presets = [x[0] for x in c.execute("select name from presets where skill=?", (r["name"],))]
+    info = dict(r) | {"path": str(bank_path(r["name"])), "on": [t["scope"] for t in toggles], "referenced_by": refs,
+                      "presets": presets}
+    info.pop("keywords", None)
     if a.json:
         say(json.dumps(info, indent=1))
         return
-    for k in ("name", "lane", "description", "source", "path", "tokens", "uses", "pinned", "on"):
+    for k in ("name", "lane", "description", "source", "path", "tokens", "uses", "pinned", "risk", "on",
+              "presets", "referenced_by"):
         v = info[k]
         if k == "pinned":
             v = "yes" if v else "no"
-        say(f"{k:<12} {v}")
-    say(f"{'last used':<12} {time.strftime('%Y-%m-%d', time.localtime(r['last_used'])) if r['last_used'] else 'never'}")
+        if isinstance(v, list):
+            v = ", ".join(v) or "-"
+        say(f"{k:<14} {v or '-'}")
+    say(f"{'last used':<14} {day(r['last_used'])}")
+    say(f"{'local edits':<14} {'yes' if r['orig_hash'] and tree_hash(bank_path(r['name'])) != r['orig_hash'] else 'no'}")
+
+
+def expand(c, a) -> list[str]:
+    names = list(a.skills or [])
+    for lane in a.lane or []:
+        rows = [r[0] for r in c.execute("select name from skills where lane=? order by name", (lane,))]
+        if not rows:
+            die(f"no lane {lane!r}")
+        names += rows
+    for p in a.preset or []:
+        names += preset_members(c, p)
+    if not names:
+        die("name one or more skills, or --lane / --preset")
+    return list(dict.fromkeys(names))
 
 
 def cmd_on(a):
     cfg = config()
     c = db()
     scope = "global" if a.glob else str(project_root(Path(a.project) if a.project else None))
-    for n in a.skills:
+    names = expand(c, a)
+    tok = 0
+    for n in names:
         r = get(c, n)
         changed = [d for d in scope_dirs(cfg, scope) if link_into(d, r["name"])]
-        c.execute("insert or replace into toggles values (?,?,?,?)", (r["name"], scope, ";".join(map(str, scope_dirs(
-            cfg, scope))), now()))
-        touch(c, r["name"], "on")
+        c.execute("insert or replace into toggles values (?,?,?,?)",
+                  (r["name"], scope, ";".join(map(str, scope_dirs(cfg, scope))), now()))
+        touch(c, r["name"], "on", detail=scope)
+        tok += len(r["description"]) // 4 + 8
         say(f"[on]    {r['name']} -> {'every harness' if scope == 'global' else scope}"
             f"{'' if changed else ' (already linked)'}")
+    if scope != "global":
+        root = Path(scope)
+        git_exclude(root, [f"{d}/{n}" for d in cfg["project_dirs"] for n in names])
+        remember_project(c, root)
+        if a.save:
+            m = read_manifest(root)
+            m["skills"] = list(set(m["skills"]) | set(names))
+            for n in names:
+                src = remote_source(get(c, n))
+                if src:
+                    m["sources"][n] = src
+            write_manifest(root, m)
+            say(f"[save]  {root / MANIFEST}")
+    if len(names) > 3:
+        say(f"{len(names)} skills on: about {tok} tokens of listing in every session there")
     c.commit()
 
 
@@ -741,11 +1746,18 @@ def cmd_off(a):
     cfg = config()
     c = db()
     scope = "global" if a.glob else str(project_root(Path(a.project) if a.project else None))
-    for n in a.skills:
+    names = expand(c, a)
+    for n in names:
         removed = [d for d in scope_dirs(cfg, scope) if unlink_from(d, n)]
         c.execute("delete from toggles where skill=? and scope=?", (n, scope))
         event(c, n, "off", scope)
         say(f"[off]   {n} ({len(removed)} link(s) removed)")
+    if a.save and scope != "global":
+        root = Path(scope)
+        m = read_manifest(root)
+        m["skills"] = [s for s in m["skills"] if s not in names]
+        write_manifest(root, m)
+        say(f"[save]  {root / MANIFEST}")
     c.commit()
 
 
@@ -763,60 +1775,296 @@ def cmd_remove(a):
     cfg = config()
     for n in a.skills:
         get(c, n)
+        refs = [x[0] for x in c.execute("select path from refs where skill=?", (n,))]
+        if refs and not a.force:
+            say(f"[held]  {n} is referenced by {', '.join(refs[:3])}; --force removes it anyway")
+            continue
         remove_skill(c, cfg, n)
     write_registry(c, cfg)
     c.commit()
 
 
 def remove_skill(c, cfg, n):
-    if True:
-        for t in c.execute("select scope from toggles where skill=?", (n,)).fetchall():
-            for d in scope_dirs(cfg, t["scope"]):
-                unlink_from(d, n)
-        p = bank_path(n)
-        COLD.mkdir(parents=True, exist_ok=True)
-        dst = COLD / n
-        if dst.exists() or dst.is_symlink():
-            shutil.rmtree(dst) if dst.is_dir() and not dst.is_symlink() else dst.unlink()
-        if p.is_symlink() or p.exists():
-            shutil.move(str(p), str(dst))
-        c.execute("delete from toggles where skill=?", (n,))
-        c.execute("delete from skills where name=?", (n,))
-        event(c, n, "remove", "moved to cold")
-        say(f"[cold]  {n} -> {dst}  (restore: skills-gate add {dst})")
+    for t in c.execute("select scope from toggles where skill=?", (n,)).fetchall():
+        for d in scope_dirs(cfg, t["scope"]):
+            unlink_from(d, n)
+    p = bank_path(n)
+    COLD.mkdir(parents=True, exist_ok=True)
+    dst = COLD / n
+    rm(dst)
+    if p.is_symlink() or p.exists():
+        shutil.move(str(p), str(dst))
+    c.execute("delete from toggles where skill=?", (n,))
+    c.execute("delete from skills where name=?", (n,))
+    c.execute("delete from presets where skill=?", (n,))
+    event(c, n, "remove", "moved to cold")
+    say(f"[cold]  {n} -> {dst}  (restore: skills-gate add {dst})")
 
 
-def harvest_usage(c, cfg) -> int:
-    """Skill tool calls in Claude Code transcripts since the last harvest. Reads tool names and inputs only."""
-    since = int(meta_get(c, "harvest_at", "0"))
+# ---------------------------------------------------------------------------------------------------- presets
+
+def cmd_preset(a):
+    c = db()
+    if a.action == "list" or not a.action:
+        for r in c.execute("select name, count(*) n, group_concat(skill, ', ') s from presets group by name order by name"):
+            say(f"{r['name']:<20} {r['n']:>3}  {short(r['s'], 90)}")
+        return
+    if not a.name:
+        die(f"preset {a.action} needs a name")
+    if a.action == "show":
+        for s in preset_members(c, a.name):
+            say(s)
+        return
+    if a.action in ("save", "add"):
+        if not a.skills:
+            die("name the skills")
+        for s in a.skills:
+            get(c, s)
+        if a.action == "save":
+            c.execute("delete from presets where name=?", (a.name,))
+        c.executemany("insert or ignore into presets values (?,?)", [(a.name, s) for s in a.skills])
+        say(f"[preset] {a.name}: {', '.join(preset_members(c, a.name))}")
+    elif a.action == "rm":
+        if a.skills:
+            c.executemany("delete from presets where name=? and skill=?", [(a.name, s) for s in a.skills])
+        else:
+            c.execute("delete from presets where name=?", (a.name,))
+        say(f"[preset] {a.name} updated")
+    c.commit()
+
+
+# ---------------------------------------------------------------------------------------------------- projects
+
+def cmd_project(a):
+    cfg = config()
+    c = db()
+    root = project_root(Path(a.project) if a.project else None)
+    m = read_manifest(root)
+    if a.action == "show":
+        say(f"project {root}  ({MANIFEST} {'present' if (root / MANIFEST).exists() else 'absent'})")
+        on = {r[0] for r in c.execute("select skill from toggles where scope=?", (str(root),))}
+        for n in sorted(manifest_skills(c, root) | on):
+            state = ("on" if n in on else "off") + (", in manifest" if n in manifest_skills(c, root) else "") + \
+                    ("" if in_bank(n) else ", NOT IN BANK")
+            say(f"  {n:<30} {state}")
+        return
+    if a.action == "save":
+        on = sorted(r[0] for r in c.execute("select skill from toggles where scope=?", (str(root),)))
+        m["skills"] = on
+        m["sources"] = {n: remote_source(get(c, n)) for n in on if remote_source(get(c, n))}
+        write_manifest(root, m)
+        say(f"[save]  {root / MANIFEST}: {', '.join(on) or 'no skills on here'}")
+        return
+    # sync: install what is missing (from recorded sources), then switch everything in the manifest on
+    names = set(m.get("skills", []))
+    for p in m.get("presets", []):
+        got = preset_members(c, p, strict=False)
+        if not got:
+            say(f"[miss]  preset {p} is not defined on this machine")
+        names |= set(got)
+    missing = sorted(n for n in names if not in_bank(n))
+    with tempfile.TemporaryDirectory(prefix="skills-gate-") as td:
+        for n in missing:
+            src = parse_source(m.get("sources", {}).get(n, ""))
+            if not src:
+                say(f"[miss]  {n}: not in the bank and no source recorded in {MANIFEST}")
+                continue
+            url, rel, commit = src
+            repo, head = fetch_repo(url, "", Path(td), commit)
+            d = repo / rel if rel else repo
+            if not (d / "SKILL.md").is_file():
+                say(f"[miss]  {n}: {rel} not found in {url}")
+                continue
+            install_dirs(c, [d], remote=True, yes=a.yes, allow_risky=a.allow_risky,
+                         source_of=lambda d, url=url, rel=rel, head=head: f"{url}#{rel or '.'}@{head}")
+    present = sorted(n for n in names if in_bank(n))
+    write_registry(c, cfg)
+    c.commit()  # cmd_on opens its own connection
+    if present:
+        cmd_on(argparse.Namespace(skills=present, lane=None, preset=None, glob=False, project=str(root), save=False))
+    write_registry(c, cfg)
+    c.commit()
+    say(f"project {root}: {len(present)} of {len(names)} manifest skill(s) on")
+
+
+# ---------------------------------------------------------------------------------------------------- usage
+
+TS_KEYS = ("timestamp", "ts", "time", "created_at", "createdAt")
+# a skill folder inside a bank or a skills directory: .../skills-gate/bank/<x>/SKILL.md, .../skills/<x>/SKILL.md
+SKILL_PATH = re.compile(r"(?:skills-gate[/\\]+bank|skills)[/\\]+([A-Za-z0-9][A-Za-z0-9._-]{0,80})[/\\]+SKILL\.md")
+MAX_SKILLS_PER_CALL = 3  # a call naming more is a listing or a sweep, not a load
+
+
+def parse_ts(v):
+    if isinstance(v, (int, float)) and v > 0:
+        return int(v / 1000 if v > 1e12 else v)
+    if isinstance(v, str) and v:
+        try:
+            d = datetime.datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return int(d.timestamp())
+    return None
+
+
+def tool_calls(obj):
+    """(call id, tool name, arguments) for every tool call in a log record, whatever the harness's layout."""
+    stack = [obj]
+    while stack:
+        o = stack.pop()
+        if isinstance(o, dict):
+            name = o.get("name") or o.get("toolName")
+            if isinstance(name, str) and o.get("type") not in ("tool_result", "toolResult"):
+                for k in ("input", "arguments", "args", "params"):
+                    if k in o:
+                        yield str(o.get("id") or o.get("call_id") or o.get("toolCallId") or ""), name, o[k]
+                        break
+            stack.extend(v for v in o.values() if isinstance(v, (dict, list)))
+        elif isinstance(o, list):
+            stack.extend(v for v in o if isinstance(v, (dict, list)))
+
+
+def harvest_usage(c, cfg) -> dict[str, int]:
+    """Skill loads in every configured harness's session logs since the last harvest: the Skill tool, and any tool
+    call whose arguments open a <skill>/SKILL.md. Reads tool names and arguments only. Each call counts once."""
     names = {r[0] for r in c.execute("select name from skills")}
-    hits = 0
-    root = Path(cfg["usage_sources"].get("claude", "")).expanduser()
-    if root.is_dir():
+    totals = {}
+    for src, root in cfg.get("usage_sources", {}).items():
+        root = Path(root).expanduser() if root else None
+        if not root or not root.is_dir():
+            continue
+        key = f"harvest_at:{src}"
+        since = int(meta_get(c, key, meta_get(c, "harvest_at", "0") if src == "claude" else "0"))
+        start, hits = now(), 0
         for f in root.rglob("*.jsonl"):
             try:
-                if f.stat().st_mtime < since:
+                mtime = f.stat().st_mtime
+                if mtime < since:
                     continue
                 with f.open(encoding="utf-8", errors="replace") as fh:
                     for line in fh:
-                        if '"Skill"' not in line:
+                        if "SKILL.md" not in line and '"Skill"' not in line:
                             continue
                         try:
                             d = json.loads(line)
                         except ValueError:
                             continue
-                        for part in (d.get("message") or {}).get("content") or []:
-                            if isinstance(part, dict) and part.get("type") == "tool_use" and part.get("name") == "Skill":
-                                skill = str((part.get("input") or {}).get("skill", "")).split(":")[-1]
-                                ts = d.get("timestamp", "")
-                                at = int(time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))) if ts else now()
-                                if skill in names and at > since:
-                                    touch(c, skill, "seen", at)
+                        ts = None
+                        if isinstance(d, dict):
+                            for k in TS_KEYS:
+                                ts = parse_ts(d.get(k))
+                                if ts:
+                                    break
+                        ts = ts or int(mtime)
+                        for cid, tool, args in tool_calls(d):
+                            text = args if isinstance(args, str) else json.dumps(args)
+                            found = {m.group(1) for m in SKILL_PATH.finditer(text)}
+                            if len(found) > MAX_SKILLS_PER_CALL:
+                                continue
+                            if tool == "Skill" and isinstance(args, dict):
+                                found.add(str(args.get("skill", "")).split(":")[-1])
+                            for s in found & names:
+                                ref = f"{src}:{cid or hashlib.sha1(line.encode()).hexdigest()[:20]}:{s}"
+                                if c.execute("insert or ignore into harvested values (?,?)", (ref, ts)).rowcount:
+                                    touch(c, s, "seen", ts, detail=src)
                                     hits += 1
             except OSError:
                 continue
-    meta_set(c, "harvest_at", now())
-    return hits
+        meta_set(c, key, start)
+        totals[src] = hits
+    return totals
+
+
+def cmd_harvest(a):
+    c = db()
+    cfg = config()
+    if a.reset:
+        c.execute("delete from events where kind='seen'")
+        c.execute("delete from harvested")
+        c.execute("delete from meta where key like 'harvest_at%'")
+        c.execute("update skills set uses=(select count(*) from events e where e.skill=skills.name and"
+                  " e.kind in ('use','on')), last_used=(select max(at) from events e where e.skill=skills.name and"
+                  " e.kind in ('use','on'))")
+        say("[reset] harvested usage cleared; counting again from every log")
+    t = harvest_usage(c, cfg)
+    write_registry(c, cfg)
+    c.commit()
+    say("usage: " + (", ".join(f"{k} {v}" for k, v in t.items()) or "no sources found") + " new skill load(s)")
+
+
+REF_RX = re.compile(r"skills-gate/bank/([A-Za-z0-9][A-Za-z0-9._-]*)|skills-gate\s+(?:use|on)\s+([A-Za-z0-9][A-Za-z0-9._-]*)")
+TEXT_EXT = {".md", ".yaml", ".yml", ".json", ".toml", ".txt", ".py", ".sh", ".ts", ".js", ".ini", ".cfg", ""}
+
+
+def scan_refs(c, cfg) -> tuple[int, set[str]]:
+    """Which bank skills something else depends on: links into the bank, `skills-gate/bank/<x>` paths and
+    `skills-gate use <x>` lines under ref_roots, links in harness folders, and project manifests. Held skills
+    never go cold."""
+    names = {r[0] for r in c.execute("select name from skills")}
+    found, unknown = set(), set()
+
+    def note(skill, where):
+        if skill in names:
+            found.add((skill, str(where)))
+        elif skill and not skill.startswith("<"):
+            unknown.add(skill)
+
+    bank_name = bank_target
+
+    roots = [Path(p).expanduser() for p in cfg.get("ref_roots", [])]
+    for root in roots:
+        if root.is_file():
+            walk = [(str(root.parent), [], [root.name])]
+        elif root.is_dir():
+            walk = os.walk(root)
+        else:
+            continue
+        for dirpath, dirnames, filenames in walk:
+            keep = []
+            for d in dirnames:
+                p = Path(dirpath) / d
+                if p.is_symlink():
+                    note_link(p, note, bank_name)  # a linked skill folder: a reference, never walked into
+                elif d not in SKIP_PARTS:
+                    keep.append(d)
+            dirnames[:] = keep
+            for fn in filenames:
+                p = Path(dirpath) / fn
+                if p.is_symlink():
+                    note_link(p, note, bank_name)
+                    continue
+                if p.suffix.lower() not in TEXT_EXT:
+                    continue
+                try:
+                    if p.stat().st_size > 1_000_000:
+                        continue
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                for m in REF_RX.finditer(text):
+                    note(m.group(1) or m.group(2), p)
+    for d in harness_dirs(cfg).values():
+        for e in d.iterdir():
+            if e.is_symlink():
+                note_link(e, note, bank_name)
+    for scope in set(json.loads(meta_get(c, "projects", "[]"))) | {r[0] for r in c.execute(
+            "select distinct scope from toggles where scope != 'global'")}:
+        root = Path(scope)
+        if (root / MANIFEST).is_file():
+            for s in manifest_skills(c, root):
+                note(s, root / MANIFEST)
+    c.execute("delete from refs")
+    c.executemany("insert or ignore into refs values (?,?)", sorted(found))
+    return len({s for s, _ in found}), unknown
+
+
+def note_link(p: Path, note, bank_name) -> bool:
+    n = bank_name(p) if p.is_symlink() else None
+    if n:
+        note(n, p)
+    return bool(n)
 
 
 def visible_cost(cfg) -> dict[str, int]:
@@ -838,13 +2086,20 @@ def cmd_tidy(a):
     c = db()
     dry = a.dry_run
     seen = harvest_usage(c, cfg)
-    say(f"usage: {seen} new Skill call(s) found in transcripts")
+    say("usage: " + (", ".join(f"{k} {v}" for k, v in seen.items()) or "no sources") + " new skill load(s)")
+    held_n, unknown = scan_refs(c, cfg)
+    held = {r[0] for r in c.execute("select distinct skill from refs")}
+    say(f"held: {held_n} skill(s) referenced by prompts, links or project manifests")
+    if unknown:
+        say(f"[ref?]  referenced but not in the bank: {', '.join(sorted(unknown)[:12])}")
     cutoff = now() - cfg["prune_days"] * DAY
     for t in c.execute("select t.skill, t.scope, t.on_at, s.last_used, s.pinned from toggles t join skills s"
                        " on s.name=t.skill").fetchall():
         last = max(t["on_at"], t["last_used"] or 0)
         if t["pinned"] or last >= cutoff:
             continue
+        if t["scope"] != "global" and t["skill"] in manifest_skills(c, Path(t["scope"])):
+            continue  # the project's manifest asks for it
         say(f"[stale] {t['skill']} in {t['scope']} (idle {int((now() - last) / DAY)} d) -> off")
         if not dry:
             for d in scope_dirs(cfg, t["scope"]):
@@ -853,7 +2108,7 @@ def cmd_tidy(a):
             event(c, t["skill"], "prune", t["scope"])
     cold_cut = now() - cfg["cold_days"] * DAY
     for r in c.execute("select name, added_at, last_used from skills where pinned=0").fetchall():
-        if r["name"] in always_on(cfg):
+        if r["name"] in always_on(cfg) or r["name"] in held:
             continue
         if max(r["added_at"], r["last_used"] or 0) < cold_cut:
             say(f"[cold]  {r['name']} unused {int((now() - max(r['added_at'], r['last_used'] or 0)) / DAY)} d")
@@ -868,8 +2123,7 @@ def cmd_tidy(a):
     keep = always_on(cfg)
     leaks = [(h, e.name) for h, d in harness_dirs(cfg).items() for e in d.iterdir()
              if not e.name.startswith(".") and e.name not in keep and (e / "SKILL.md").is_file()
-             and not (e.is_symlink() and Path(os.readlink(e)) == bank_path(e.name)
-                      and c.execute("select 1 from toggles where skill=? and scope='global'", (e.name,)).fetchone())]
+             and not (links_to(e, e.name) and is_global_toggle(c, e.name))]
     if leaks:
         say(f"[leak]  {len(leaks)} skill(s) bypass the gate: " + ", ".join(f"{h}/{n}" for h, n in leaks[:12]))
         if a.fix and not dry:
@@ -889,7 +2143,7 @@ def cmd_tidy(a):
 
 
 def reindex(c, relane: bool = False) -> int:
-    """Re-read every bank skill's front matter, size and hash (and re-guess lanes still on 'general')."""
+    """Re-read every bank skill's front matter, size, keywords and hash (and re-guess lanes still on 'general')."""
     n = 0
     for r in c.execute("select name, lane from skills").fetchall():
         p = bank_path(r["name"])
@@ -897,8 +2151,8 @@ def reindex(c, relane: bool = False) -> int:
             continue
         desc = frontmatter(p / "SKILL.md").get("description", "")
         lane = guess_lane(r["name"], desc) if relane and r["lane"] == "general" else r["lane"]
-        c.execute("update skills set description=?, tokens=?, hash=?, lane=? where name=?",
-                  (desc, est_tokens(p / "SKILL.md"), tree_hash(p), lane, r["name"]))
+        c.execute("update skills set description=?, tokens=?, hash=?, lane=?, keywords=? where name=?",
+                  (desc, est_tokens(p / "SKILL.md"), tree_hash(p), lane, body_keywords(p / "SKILL.md"), r["name"]))
         n += 1
     return n
 
@@ -911,18 +2165,87 @@ def cmd_reindex(a):
     say(f"reindexed {n} skill(s)")
 
 
+def cmd_stats(a):
+    c = db()
+    cfg = config()
+    since = now() - a.days * DAY
+    say(f"last {a.days} days")
+    for r in c.execute("select coalesce(nullif(detail,''),'gate') src, count(*) n from events where kind in"
+                       " ('use','seen') and at>=? group by src order by n desc", (since,)):
+        src = "skills-gate use" if r["src"] == "gate" else r["src"]
+        say(f"  loads via {src:<16} {r['n']}")
+    say("most used:")
+    for r in c.execute("select skill, count(*) n from events where kind in ('use','seen','on') and at>=?"
+                       " group by skill order by n desc limit ?", (since, a.limit)):
+        say(f"  {r['skill']:<30} {r['n']}")
+    total = c.execute("select count(*) from skills").fetchone()[0]
+    never = c.execute("select count(*) from skills where uses=0").fetchone()[0]
+    soon = c.execute("select count(*) from skills where pinned=0 and max(added_at, coalesce(last_used,0)) < ? and"
+                     " name not in (select skill from refs)", (now() - (cfg["cold_days"] - 30) * DAY,)).fetchone()[0]
+    say(f"bank: {total} skills, {never} never used, {soon} going cold within 30 days")
+    sug = c.execute("select at, detail from events where kind='suggest' and at>=?", (since,)).fetchall()
+    if sug:
+        hit = 0
+        for s in sug:
+            names = json.loads(s["detail"] or "{}").get("skills", [])
+            q = ",".join("?" * len(names))
+            if names and c.execute(f"select 1 from events where kind in ('use','seen','on') and skill in ({q}) and"
+                                   f" at between ? and ?", (*names, s["at"], s["at"] + 1800)).fetchone():
+                hit += 1
+        say(f"suggestions: {len(sug)} prompts got one, {hit} ({100 * hit // len(sug)}%) followed by a load"
+            f" of a suggested skill within 30 min")
+    else:
+        say("suggestions: none recorded (is the prompt hook installed? `skills-gate hook`)")
+
+
+def cmd_bench(a):
+    """recall@1, recall@k and MRR of the ranker on a JSONL file of {"prompt": ..., "expect": name | [names]}."""
+    c = db()
+    cfg = config()
+    rows = c.execute("select * from skills").fetchall()
+    idx = Index(rows)
+    cases = [json.loads(ln) for ln in Path(a.file).read_text().splitlines() if ln.strip()]
+    r1 = rk = mrr = fired = right = 0
+    misses = []
+    for case in cases:
+        exp = {case["expect"]} if isinstance(case["expect"], str) else set(case["expect"])
+        hits = idx.rank(case["prompt"], 10)
+        names = [r["name"] for _, r in hits]
+        rank = next((i for i, n in enumerate(names) if n in exp), None)
+        picks = [r["name"] for _, r in confident(hits, cfg, n_docs=len(rows))]
+        if picks:
+            fired += 1
+            right += bool(exp & set(picks))
+        if rank == 0:
+            r1 += 1
+        if rank is not None and rank < a.k:
+            rk += 1
+        mrr += 1 / (rank + 1) if rank is not None else 0
+        if rank is None or rank >= a.k:
+            misses.append((case["prompt"], sorted(exp), names[:3]))
+    n = max(1, len(cases))
+    say(f"{len(cases)} cases: recall@1 {r1 / n:.2f}, recall@{a.k} {rk / n:.2f}, MRR {mrr / n:.2f}")
+    say(f"suggest fired on {fired}/{len(cases)}, right on {right}/{fired or 1} "
+        f"(score bar {min_score(cfg, len(rows))}, ratio {cfg['suggest']['ratio']})")
+    for p, e, got in misses[: a.show]:
+        say(f"  miss: {short(p, 60)!r} wanted {', '.join(e)}, got {', '.join(got) or '-'}")
+
+
 def cmd_status(a):
     cfg = config()
     c = db()
     n = c.execute("select count(*) from skills").fetchone()[0]
     used = c.execute("select count(*) from skills where uses>0").fetchone()[0]
+    held = c.execute("select count(distinct skill) from refs").fetchone()[0]
     say(f"skills-gate {VERSION}  home {HOME}")
-    say(f"bank: {n} skills ({used} ever used), cold: {len(list(COLD.glob('*'))) if COLD.exists() else 0}")
+    say(f"bank: {n} skills ({used} ever used, {held} held by references), cold: "
+        f"{len(list(COLD.glob('*'))) if COLD.exists() else 0}")
     say(f"always on: {', '.join(sorted(always_on(cfg)))}")
     for t in c.execute("select skill, scope, on_at from toggles order by scope, skill"):
         say(f"on: {t['skill']:<30} {t['scope']}")
     tidy = meta_get(c, "tidy_at")
     say(f"last tidy: {time.strftime('%Y-%m-%d %H:%M', time.localtime(int(tidy))) if tidy else 'never'}")
+    say(f"remote: {meta_get(c, 'remote') or 'none'}")
     say("always-loaded listing (tokens): " + ", ".join(f"{k} {v}" for k, v in visible_cost(cfg).items()))
 
 
@@ -939,6 +2262,8 @@ def cmd_doctor(a):
         if not (bank_path(r[0]) / "SKILL.md").is_file():
             bad += 1
             say(f"BAD {r[0]}: no SKILL.md in the bank")
+    for r in c.execute("select name, risk from skills where risk='high' order by name"):
+        say(f"warn {r[0]}: high-risk scan findings (skills-gate scan {r[0]})")
     say("doctor: " + ("all good" if not bad else f"{bad} problem(s)"))
     raise SystemExit(1 if bad else 0)
 
@@ -948,18 +2273,539 @@ def cmd_timer(a):
     exe = Path(sys.argv[0]).resolve()
     unit_dir = Path.home() / ".config" / "systemd" / "user"
     if not shutil.which("systemctl"):
-        say(f"no systemd: add this to `crontab -e`:\n17 4 * * * {exe} tidy --fix >> {HOME}/tidy.log 2>&1")
+        say(f"no systemd: add this to `crontab -e`:\n17 4 * * * {exe} tidy --fix >> {HOME}/tidy.log 2>&1; "
+            f"{exe} market refresh >> {HOME}/tidy.log 2>&1")
         return
     unit_dir.mkdir(parents=True, exist_ok=True)
     (unit_dir / "skills-gate-tidy.service").write_text(
         f"[Unit]\nDescription=skills-gate daily tidy\n\n[Service]\nType=oneshot\n"
-        f"ExecStart={sys.executable} {exe} tidy --fix\nNice=10\n")
+        f"ExecStart={sys.executable} {exe} tidy --fix\n"
+        f"ExecStart=-{sys.executable} {exe} market refresh\nNice=10\n")
     (unit_dir / "skills-gate-tidy.timer").write_text(
         "[Unit]\nDescription=skills-gate daily tidy\n\n[Timer]\nOnCalendar=*-*-* 04:17\nPersistent=true\n"
         "RandomizedDelaySec=10min\n\n[Install]\nWantedBy=timers.target\n")
     subprocess.run(["systemctl", "--user", "daemon-reload"])
     subprocess.run(["systemctl", "--user", "enable", "--now", "skills-gate-tidy.timer"])
-    say("[timer] skills-gate-tidy.timer enabled (daily 04:17)")
+    say("[timer] skills-gate-tidy.timer enabled (daily 04:17: tidy, then the market catalog refresh)")
+
+
+# ---------------------------------------------------------------------------------------------------- scan / audit
+
+def cmd_scan(a):
+    c = db()
+    target = Path(a.target).expanduser()
+    if target.exists():
+        dirs = find_skill_dirs(target) or [target]
+        for d in dirs:
+            f = scan_tree(d)
+            if a.json:
+                say(json.dumps({"path": str(d), "level": scan_level(f), "findings": f}, indent=1))
+            else:
+                print_scan(d.name, d, f, limit=a.limit)
+        return
+    r = get(c, a.target)
+    f = scan_tree(bank_path(r["name"]))
+    c.execute("update skills set risk=? where name=?", (scan_level(f), r["name"]))
+    c.commit()
+    if a.json:
+        say(json.dumps({"name": r["name"], "level": scan_level(f), "findings": f}, indent=1))
+    else:
+        print_scan(r["name"], bank_path(r["name"]), f, limit=a.limit)
+
+
+def cmd_audit(a):
+    c = db()
+    counts = {"high": [], "medium": [], "low": [], "": []}
+    for r in c.execute("select name from skills order by name").fetchall():
+        p = bank_path(r["name"])
+        if not (p / "SKILL.md").is_file():
+            continue
+        lvl = scan_level(scan_tree(p))
+        c.execute("update skills set risk=? where name=?", (lvl, r["name"]))
+        counts[lvl].append(r["name"])
+    write_registry(c, config())
+    c.commit()
+    say(f"audit: {len(counts['high'])} high, {len(counts['medium'])} medium, {len(counts['low'])} low, "
+        f"{len(counts[''])} clean")
+    for lvl in ("high", "medium"):
+        if counts[lvl]:
+            say(f"{lvl}: {', '.join(counts[lvl])}")
+    say("read a skill's findings with: skills-gate scan <name>")
+
+
+# ---------------------------------------------------------------------------------------------------- updates
+
+def upstream_of(row, td: Path, cache: dict):
+    """Fetch the latest upstream copy of a skill: (state, dir or None, new source string)."""
+    if row["link"]:
+        return "linked", None, ""
+    src = parse_source(row["source"])
+    if src is None:
+        local = Path(row["source"]).expanduser()
+        if local.is_dir() and (local / "SKILL.md").is_file():
+            return "local", local, row["source"]
+        return "no-source", None, ""
+    url, rel, commit = src
+    key = (url, row["ref"])
+    if key not in cache:
+        r = git_run(["ls-remote", url, row["ref"] or "HEAD"], timeout=60)
+        cache[key] = {"head": r.stdout.split()[0] if r.returncode == 0 and r.stdout.strip() else "", "repo": None}
+    ent = cache[key]
+    if not ent["head"]:
+        return "unreachable", None, ""
+    if commit and ent["head"].startswith(commit):
+        return "same", None, ""
+    if ent["repo"] is None:
+        ent["repo"], ent["short"] = fetch_repo(url, row["ref"], td)
+    repo, head = ent["repo"], ent["short"]
+    d = repo / rel if rel else repo
+    if not (d / "SKILL.md").is_file():
+        return "gone", None, ""
+    return "remote", d, f"{url}#{rel or '.'}@{head}"
+
+
+def check_updates(c, names: list[str], td: Path) -> list[dict]:
+    rows = [get(c, n) for n in names] if names else c.execute("select * from skills order by name").fetchall()
+    cache, out = {}, []
+    for r in rows:
+        bank = bank_path(r["name"])
+        edited = bool(r["orig_hash"]) and (bank / "SKILL.md").is_file() and tree_hash(bank) != r["orig_hash"]
+        kind, new_dir, new_src = upstream_of(r, td, cache)
+        state = {"linked": "linked", "no-source": "no source", "unreachable": "unreachable", "same": "current",
+                 "gone": "gone upstream"}.get(kind)
+        if state is None:
+            state = "current" if tree_hash(new_dir) == r["orig_hash"] else "update"
+        out.append({"name": r["name"], "state": state, "edited": edited, "dir": new_dir, "source": new_src,
+                    "ref": r["ref"], "row": r})
+    return out
+
+
+def cmd_outdated(a):
+    c = db()
+    with tempfile.TemporaryDirectory(prefix="skills-gate-") as td:
+        res = check_updates(c, a.skills, Path(td))
+    shown = [e for e in res if a.all or e["state"] not in ("current", "linked", "no source") or e["edited"]]
+    if a.json:
+        say(json.dumps([{k: e[k] for k in ("name", "state", "edited", "source")} for e in shown], indent=1))
+        return
+    for e in shown:
+        say(f"{e['name']:<32} {e['state']:<14}{'  edited here' if e['edited'] else ''}")
+    ups = sum(e["state"] == "update" for e in res)
+    say(f"{ups} update(s) available, {sum(e['edited'] for e in res)} edited here, "
+        f"{sum(e['state'] == 'unreachable' for e in res)} unreachable; `skills-gate diff <name>`, "
+        f"`skills-gate update <name>`")
+
+
+def tree_diff(old: Path, new: Path, label_old: str, label_new: str) -> list[str]:
+    a = {str(r): f for f, r in files_of(old)} if old.exists() else {}
+    b = {str(r): f for f, r in files_of(new)}
+    out = []
+    for rel in sorted(set(a) | set(b)):
+        da = a[rel].read_bytes() if rel in a else b""
+        db_ = b[rel].read_bytes() if rel in b else b""
+        if da == db_:
+            continue
+        if b"\x00" in da[:4096] or b"\x00" in db_[:4096]:
+            out.append(f"Binary file {rel} differs\n")
+            continue
+        out += difflib.unified_diff(da.decode("utf-8", "replace").splitlines(True),
+                                    db_.decode("utf-8", "replace").splitlines(True),
+                                    f"{label_old}/{rel}" if rel in a else "/dev/null",
+                                    f"{label_new}/{rel}" if rel in b else "/dev/null")
+    return out
+
+
+def cmd_diff(a):
+    c = db()
+    with tempfile.TemporaryDirectory(prefix="skills-gate-") as td:
+        r = get(c, a.skill)
+        kind, d, _ = upstream_of(r, Path(td), {})
+        if kind == "same":  # nothing new upstream: show local edits against the recorded commit
+            url, rel, commit = parse_source(r["source"])
+            repo, _ = fetch_repo(url, r["ref"], Path(td), commit)
+            d = repo / rel if rel else repo
+        if d is None:
+            die(f"{a.skill}: {kind}; nothing to compare with")
+        lines = tree_diff(bank_path(r["name"]), d, "bank", "upstream")
+    sys.stdout.writelines(lines)
+    if not lines:
+        say(f"{a.skill}: bank copy matches upstream")
+
+
+def cmd_update(a):
+    c = db()
+    cfg = config()
+    if not a.skills and not a.all:
+        die("name skills to update, or --all")
+    with tempfile.TemporaryDirectory(prefix="skills-gate-") as td:
+        res = [e for e in check_updates(c, a.skills, Path(td)) if e["state"] == "update"]
+        plan = []
+        for e in res:
+            if e["edited"] and not a.force:
+                say(f"[skip]  {e['name']}: edited here (see `skills-gate diff {e['name']}`); --force overwrites,"
+                    f" keeping the old copy in cold/")
+                continue
+            changes = sum(1 for ln in tree_diff(bank_path(e["name"]), e["dir"], "a", "b") if ln.startswith("+++"))
+            f = scan_tree(e["dir"])
+            say(f"[new]   {e['name']}: {changes} file(s) change")
+            print_scan(e["name"], e["dir"], f, limit=6)
+            if scan_level(f) == "high" and not a.allow_risky:
+                say(f"[block] {e['name']}: high-risk findings in the new version; --allow-risky after reading them")
+                continue
+            plan.append(e)
+        if not plan:
+            say("nothing to update")
+            return
+        if any("://" in e["source"] or e["source"].startswith("git@") for e in plan) and \
+                not confirm(f"Update {len(plan)} skill(s)?", a.yes):
+            say("nothing updated")
+            return
+        for e in plan:
+            keep_copy(e["name"], "pre-update")
+            register(c, e["dir"], force=True, source=e["source"], ref=e["ref"], kind="update",
+                     name=e["name"])
+    write_registry(c, cfg)
+    c.commit()
+    say(f"updated {len(plan)} skill(s); old copies in {COLD}")
+
+
+# ---------------------------------------------------------------------------------------------------- push / pull
+
+SECRET_RX = re.compile(r"(^\.env(\..*)?$|\.pem$|\.key$|\.p12$|^id_(rsa|ed25519|ecdsa)|credentials|\.token$|"
+                       r"^secrets?\.(json|ya?ml|toml)$)", re.I)
+
+
+def sync_skip(f: Path, rel: Path) -> bool:
+    try:
+        return bool(SECRET_RX.search(f.name)) or f.stat().st_size > 10_000_000
+    except OSError:
+        return True
+
+
+def sync_hash(p: Path) -> str:
+    return tree_hash(p, skip=sync_skip)
+
+
+def sync_git(args, check=True):
+    r = git_run(args, cwd=SYNC)
+    if check and r.returncode != 0:
+        die(f"git {' '.join(args)} failed: {r.stderr.strip()[:300]}")
+    return r
+
+
+def cmd_remote(a):
+    c = db()
+    if not a.url:
+        say(f"remote: {meta_get(c, 'remote') or 'none'}  (sync folder {SYNC})")
+        return
+    meta_set(c, "remote", a.url)
+    c.commit()
+    if not (SYNC / ".git").is_dir():
+        SYNC.mkdir(parents=True, exist_ok=True)
+        sync_git(["init", "-q", "-b", "main"])
+        sync_git(["remote", "add", "origin", a.url])
+    else:
+        sync_git(["remote", "set-url", "origin", a.url])
+    say(f"[remote] {a.url}; `skills-gate pull` then `skills-gate push`")
+
+
+def sync_fetch(c) -> dict:
+    """Bring the sync folder to the remote's state and return its registry."""
+    if not meta_get(c, "remote"):
+        die("no remote set; run `skills-gate remote <git-url>` (a private repo you own)")
+    if not (SYNC / ".git").is_dir():
+        cmd_remote(argparse.Namespace(url=meta_get(c, "remote")))
+    sync_git(["fetch", "-q", "origin"], check=False)
+    if sync_git(["rev-parse", "-q", "--verify", "origin/main"], check=False).returncode == 0:
+        sync_git(["checkout", "-q", "-f", "-B", "main", "origin/main"])  # the folder is only an export
+        sync_git(["clean", "-q", "-fd"])
+    reg = SYNC / "registry.json"
+    return json.loads(reg.read_text()) if reg.is_file() else {"skills": {}, "presets": {}}
+
+
+def sync_merge(c, reg: dict, policy: str) -> dict:
+    """Three-way merge per skill: base = the hash both sides had at the last sync."""
+    base = {r[0]: r[1] for r in c.execute("select name, hash from sync_state")}
+    local = {r["name"]: r for r in c.execute("select * from skills")}
+    stats = {"new": 0, "took": 0, "kept": 0, "conflict": 0, "removed": 0}
+    for name, info in reg.get("skills", {}).items():
+        if not NAME_RX.match(name):
+            continue
+        rdir, hr, hb, row = SYNC / "skills" / name, info["hash"], base.get(name), local.get(name)
+        meta = {"lane": info.get("lane"), "pinned": info.get("pinned", 0)}
+        have_copy = (rdir / "SKILL.md").is_file()
+        if row is None:
+            if hb is not None and hb == hr:
+                continue  # removed here since the last sync; the push records the removal there too
+            if hb is not None and policy != "theirs":
+                if policy == "mine":
+                    stats["kept"] += 1
+                    continue
+                if have_copy:  # removed here, changed there
+                    dst = CONFLICTS / name
+                    rm(dst)
+                    CONFLICTS.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(rdir, dst)
+                say(f"[conflict] {name}: removed here, changed there; theirs saved in {CONFLICTS / name}"
+                    f" (pull --theirs brings it back, --mine keeps it removed)")
+                stats["conflict"] += 1
+                continue
+            ls = info.get("link_source")
+            if ls and (Path(ls) / "SKILL.md").is_file():
+                register(c, Path(ls), link=True, source=info.get("source", ""), kind="pull", meta=meta)
+            elif have_copy:
+                register(c, rdir, source=info.get("source", ""), kind="pull", meta=meta)
+            else:
+                warn(f"{name}: listed by the remote but its files are missing there; skipped")
+                continue
+            c.execute("insert or replace into sync_state values (?,?)", (name, hr))
+            stats["new"] += 1
+            continue
+        hl = sync_hash(bank_path(name))
+        if hl == hr:
+            c.execute("insert or replace into sync_state values (?,?)", (name, hr))
+            continue
+        if row["link"]:
+            say(f"[keep]  {name}: linked here, edits go through its source")
+            stats["kept"] += 1
+            continue
+        if hb == hr or (policy == "mine" and hb != hl):
+            stats["kept"] += 1  # only this side changed, or the user keeps theirs
+            continue
+        if not have_copy:
+            warn(f"{name}: the remote's copy is missing; kept this one")
+            stats["kept"] += 1
+            continue
+        if hb == hl or policy == "theirs":
+            keep_copy(name, "pre-pull")
+            register(c, rdir, force=True, source=info.get("source", row["source"]), kind="pull", meta=meta,
+                     name=name)
+            c.execute("insert or replace into sync_state values (?,?)", (name, hr))
+            stats["took"] += 1
+        else:
+            dst = CONFLICTS / name
+            rm(dst)
+            CONFLICTS.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(rdir, dst)
+            say(f"[conflict] {name}: changed here and there; theirs saved in {dst} (pull --theirs or --mine)")
+            stats["conflict"] += 1
+    # Only an explicit removal record removes a skill here: a skill merely missing from the remote (an empty
+    # remote, a broken link on the machine that pushed) is left alone.
+    for name in reg.get("removed", {}):
+        if name in reg.get("skills", {}) or name not in local or local[name]["link"] or name not in base:
+            continue
+        if sync_hash(bank_path(name)) == base[name]:
+            remove_skill(c, config(), name)
+            c.execute("delete from sync_state where name=?", (name,))
+            stats["removed"] += 1
+        else:
+            say(f"[keep]  {name}: removed on another machine, but edited here; kept (remove it to agree)")
+    for p, members in reg.get("presets", {}).items():
+        c.executemany("insert or ignore into presets values (?,?)", [(p, s) for s in members if s in local or
+                                                                     in_bank(s)])
+    return stats
+
+
+def sync_export(c, remote: dict):
+    """Write this bank into the sync folder on top of the remote's state: changed skills replaced, removals
+    recorded as tombstones, and skills that are broken here (a moved link source) left as the remote had them."""
+    skills_dir = SYNC / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    base = {r[0] for r in c.execute("select name from sync_state")}
+    rows = {r["name"]: r for r in c.execute("select * from skills order by name").fetchall()}
+    reg = {"version": 2, "skills": {}, "presets": {}, "removed": dict(remote.get("removed", {}))}
+    for name, info in remote.get("skills", {}).items():
+        if name in rows:
+            continue
+        if name in base:  # we had it and removed it: record that, drop the files
+            reg["removed"][name] = now()
+            rm(skills_dir / name)
+            c.execute("delete from sync_state where name=?", (name,))
+        else:  # never reached this bank (skipped, conflicted): keep the remote's entry
+            reg["skills"][name] = info
+    for name, r in rows.items():
+        p = bank_path(name)
+        if not (p / "SKILL.md").is_file():
+            if name in remote.get("skills", {}):
+                reg["skills"][name] = remote["skills"][name]
+            warn(f"{name}: broken here ({p}); the remote keeps its copy")
+            continue
+        reg["removed"].pop(name, None)
+        dst = skills_dir / name
+        rm(dst)
+        for f, rel in files_of(p):
+            if sync_skip(f, rel):
+                continue
+            (dst / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, dst / rel)
+        h = sync_hash(p)
+        reg["skills"][name] = {"lane": r["lane"], "description": r["description"], "source": r["source"],
+                               "link_source": str(p.resolve()) if r["link"] else "", "pinned": r["pinned"],
+                               "hash": h}
+        c.execute("insert or replace into sync_state values (?,?)", (name, h))
+    for row in c.execute("select name, group_concat(skill, '\n') s from presets group by name"):
+        reg["presets"][row["name"]] = sorted(row["s"].split("\n"))
+    (SYNC / "registry.json").write_text(json.dumps(reg, indent=1, sort_keys=True) + "\n")
+
+
+def cmd_pull(a):
+    c = db()
+    reg = sync_fetch(c)
+    st = sync_merge(c, reg, "theirs" if a.theirs else "mine" if a.mine else "ask")
+    write_registry(c, config())
+    c.commit()
+    say("pull: " + ", ".join(f"{v} {k}" for k, v in st.items()))
+    return st
+
+
+def cmd_push(a):
+    c = db()
+    reg = sync_fetch(c)
+    st = sync_merge(c, reg, "theirs" if a.theirs else "mine" if a.mine else "ask")
+    if st["conflict"]:
+        c.commit()
+        die(f"{st['conflict']} conflict(s); resolve with `skills-gate push --mine` or `pull --theirs`")
+    sync_export(c, reg)
+    write_registry(c, config())
+    c.commit()
+    sync_git(["add", "-A"])
+    if sync_git(["diff", "--cached", "--quiet"], check=False).returncode == 0:
+        say("push: nothing changed")
+        return
+    sync_git(["commit", "-q", "-m", f"skills-gate sync {time.strftime('%Y-%m-%d %H:%M')}"])
+    sync_git(["push", "-q", "origin", "HEAD:main"])
+    say(f"push: bank of {len(list((SYNC / 'skills').iterdir()))} skills sent to {meta_get(c, 'remote')}"
+        f" (merged: {', '.join(f'{v} {k}' for k, v in st.items())})")
+
+
+# ---------------------------------------------------------------------------------------------------- agents
+
+def cmd_agents(a):
+    cfg = config()
+    if a.action in (None, "list"):
+        say(f"{'agent':<10} {'state':<10} {'skills':>6}  folder")
+        for name, info in KNOWN_AGENTS.items():
+            path = Path(cfg["harness_dirs"].get(name) or info["global"]).expanduser()
+            gated = bool(cfg["harness_dirs"].get(name)) and path.is_dir()
+            state = "gated" if gated else "detected" if Path(info["home"]).expanduser().is_dir() else "-"
+            count = sum(1 for e in path.iterdir() if (e / "SKILL.md").is_file()) if path.is_dir() else 0
+            note = f"  ({info['note']})" if info.get("note") else ""
+            say(f"{name:<10} {state:<10} {count:>6}  {path}{note}")
+        for name, p in cfg["harness_dirs"].items():
+            if name not in KNOWN_AGENTS and p:
+                say(f"{name:<10} {'gated':<10} {'':>6}  {Path(p).expanduser()}  (custom)")
+        say("\nadd one: skills-gate agents add <name> [--dir PATH], then `skills-gate gate`")
+        return
+    if not a.name:
+        die(f"agents {a.action} needs a name")
+    if a.action == "add":
+        info = KNOWN_AGENTS.get(a.name, {})
+        path = a.dir or info.get("global")
+        if not path:
+            die(f"unknown agent {a.name!r}; pass --dir with its global skills folder")
+        Path(path).expanduser().mkdir(parents=True, exist_ok=True)
+
+        def add(u):
+            u.setdefault("harness_dirs", {})[a.name] = path
+            pd = u.setdefault("project_dirs", list(DEFAULT_CONFIG["project_dirs"]))
+            if info.get("project") and info["project"] not in pd and not a.no_project:
+                pd.append(info["project"])
+            if info.get("sessions"):
+                u.setdefault("usage_sources", {})[a.name] = info["sessions"]
+        edit_config(add)
+        say(f"[agent] {a.name} -> {path}; run `skills-gate gate` to move its skills behind the gate")
+    elif a.action == "remove":
+        edit_config(lambda u: u.setdefault("harness_dirs", {}).__setitem__(a.name, ""))
+        say(f"[agent] {a.name} is no longer gated; its folder keeps what is there (`ungate` restores moved skills)")
+
+
+# ---------------------------------------------------------------------------------------------------- mcp
+
+MCP_TOOLS = [
+    {"name": "skills_suggest", "description": "Rank the banked skills for a task. Start here when a task may need a "
+     "skill you do not have loaded.", "inputSchema": {"type": "object", "properties": {
+         "task": {"type": "string", "description": "the task in a sentence"}}, "required": ["task"]}},
+    {"name": "skills_use", "description": "Return a banked skill's full playbook (SKILL.md) to follow now.",
+     "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    {"name": "skills_search", "description": "Search the bank by words; market=true searches online marketplaces "
+     "(show results to the user; never install without their yes).", "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string"}, "market": {"type": "boolean"}, "limit": {"type": "integer"}},
+         "required": ["query"]}},
+    {"name": "skills_lane", "description": "List the lanes, or the skills in one lane.",
+     "inputSchema": {"type": "object", "properties": {"lane": {"type": "string"}}}},
+    {"name": "skills_show", "description": "Registry entry for one skill: lane, source, size, uses, risk.",
+     "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    {"name": "skills_on", "description": "Keep skills loaded for a project folder (links them in).",
+     "inputSchema": {"type": "object", "properties": {"names": {"type": "array", "items": {"type": "string"}},
+                                                      "project": {"type": "string"}}, "required": ["names"]}},
+    {"name": "skills_off", "description": "Unload skills from a project folder.",
+     "inputSchema": {"type": "object", "properties": {"names": {"type": "array", "items": {"type": "string"}},
+                                                      "project": {"type": "string"}}, "required": ["names"]}},
+]
+
+
+def run_captured(argv: list[str]) -> tuple[str, bool]:
+    out, err = io.StringIO(), io.StringIO()
+    ok = True
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            main(argv)
+        except SystemExit as e:
+            ok = e.code in (0, None)
+    return (out.getvalue() + err.getvalue()).strip() or "(no output)", ok
+
+
+def mcp_call(name: str, args: dict) -> tuple[str, bool]:
+    proj = ["--project", args["project"]] if args.get("project") else []
+    argv = {
+        "skills_suggest": lambda: ["suggest", args["task"], "--all", "--limit", "5"],
+        "skills_use": lambda: ["use", args["name"]],
+        "skills_search": lambda: ["search", args["query"], "--limit", str(args.get("limit", 8))]
+        + (["--market"] if args.get("market") else []),
+        "skills_lane": lambda: ["lane"] + ([args["lane"]] if args.get("lane") else []),
+        "skills_show": lambda: ["show", args["name"]],
+        "skills_on": lambda: ["on", *args["names"], *proj],
+        "skills_off": lambda: ["off", *args["names"], *proj],
+    }.get(name)
+    if argv is None:
+        return f"unknown tool {name}", False
+    try:
+        return run_captured(argv())
+    except KeyError as e:
+        return f"missing argument {e}", False
+
+
+def cmd_mcp(a):
+    """A stdio MCP server (newline-delimited JSON-RPC) for harnesses without a shell. No model, no GPU."""
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        mid, method, params = msg.get("id"), msg.get("method", ""), msg.get("params") or {}
+        if mid is None:
+            continue  # notification
+        if method == "initialize":
+            res = {"protocolVersion": params.get("protocolVersion", "2025-06-18"), "capabilities": {"tools": {}},
+                   "serverInfo": {"name": "skills-gate", "version": VERSION},
+                   "instructions": "Every skill on this machine waits in a bank. Call skills_suggest with the task, "
+                                   "then skills_use to read the playbook you need."}
+        elif method == "tools/list":
+            res = {"tools": MCP_TOOLS}
+        elif method == "tools/call":
+            text, ok = mcp_call(params.get("name", ""), params.get("arguments") or {})
+            res = {"content": [{"type": "text", "text": text}], "isError": not ok}
+        elif method == "ping":
+            res = {}
+        else:
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601,
+                                         "message": f"method not found: {method}"}}) + "\n")
+            sys.stdout.flush()
+            continue
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": res}) + "\n")
+        sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------------------------------- cli
@@ -970,12 +2816,14 @@ def main(argv=None):
     sp = ap.add_subparsers(dest="cmd", required=True)
 
     sp.add_parser("init", help="create ~/.skills-gate and put the gate skill in every harness").set_defaults(f=cmd_init)
-    p = sp.add_parser("add", help="install skills into the bank from a folder, git URL or owner/repo[/path][@ref]")
+    p = sp.add_parser("add", help="install skills from a folder, git URL or owner/repo[/path][:skill][@ref]")
     p.add_argument("source")
     p.add_argument("--lane")
     p.add_argument("--only", nargs="*", help="only these skill names from a multi-skill source")
     p.add_argument("--link", action="store_true", help="link a local folder instead of copying it")
     p.add_argument("--force", action="store_true", help="replace a skill already in the bank")
+    p.add_argument("--yes", action="store_true", help="the user agreed to this remote install")
+    p.add_argument("--allow-risky", action="store_true", help="install even with high-risk scan findings")
     p.set_defaults(f=cmd_add)
     p = sp.add_parser("adopt", help="import every skill found in existing skill folders")
     p.add_argument("paths", nargs="+")
@@ -996,12 +2844,37 @@ def main(argv=None):
     p.add_argument("lane")
     p.add_argument("skills", nargs="+")
     p.set_defaults(f=cmd_set_lane)
-    p = sp.add_parser("search", help="search the bank, or the market with --market")
+    p = sp.add_parser("suggest", help="the banked skills that fit a task, ranked (--hook: Claude Code prompt hook)")
+    p.add_argument("task", nargs="?", default="")
+    p.add_argument("--limit", type=int, default=3)
+    p.add_argument("--all", action="store_true", help="show the top matches even below the confidence bar")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--hook", action="store_true", help="read a UserPromptSubmit payload on stdin; never fails")
+    p.set_defaults(f=cmd_suggest)
+    p = sp.add_parser("hook", help="print, --write or --remove the Claude Code prompt hook that runs suggest")
+    p.add_argument("--settings", default="~/.claude/settings.json")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--write", action="store_true")
+    g.add_argument("--remove", action="store_true")
+    p.set_defaults(f=cmd_hook)
+    p = sp.add_parser("search", help="search the bank, or the marketplaces with --market")
     p.add_argument("query")
     p.add_argument("--market", action="store_true")
+    p.add_argument("--offline", action="store_true", help="live market results from the query cache only")
+    p.add_argument("--live", action="store_true", help="ask the marketplaces now instead of the local catalog")
+    p.add_argument("--all", action="store_true", help="include catalog entries that failed validation")
     p.add_argument("--limit", type=int, default=8)
     p.add_argument("--json", action="store_true")
     p.set_defaults(f=cmd_search)
+    p = sp.add_parser("market", help="the local catalog: refresh | new | show ID | validate IDS | stats")
+    p.add_argument("action", nargs="?", default="stats", choices=["refresh", "new", "show", "validate", "stats"])
+    p.add_argument("ids", nargs="*")
+    p.add_argument("--budget", type=int, help="skills to validate this run (default: market.budget)")
+    p.add_argument("--no-gather", action="store_true", help="validate only; skip reading the sources")
+    p.add_argument("--days", type=int, default=1)
+    p.add_argument("--limit", type=int, default=30)
+    p.add_argument("--all", action="store_true", help="include entries that failed validation")
+    p.set_defaults(f=cmd_market)
     p = sp.add_parser("use", help="print a skill's playbook into the session (on demand)")
     p.add_argument("skill")
     p.set_defaults(f=cmd_use)
@@ -1012,10 +2885,24 @@ def main(argv=None):
     for name, fn, hlp in (("on", cmd_on, "load skills for this project (or --global)"),
                           ("off", cmd_off, "unload skills from this project (or --global)")):
         p = sp.add_parser(name, help=hlp)
-        p.add_argument("skills", nargs="+")
+        p.add_argument("skills", nargs="*")
+        p.add_argument("--lane", action="append", help="every skill in a lane")
+        p.add_argument("--preset", action="append", help="every skill in a preset")
         p.add_argument("--global", dest="glob", action="store_true")
         p.add_argument("--project", help="project folder (default: the git root of the current folder)")
+        p.add_argument("--save", action="store_true", help=f"also record it in the project's {MANIFEST}")
         p.set_defaults(f=fn)
+    p = sp.add_parser("preset", help="named skill sets: list | show NAME | save NAME SKILLS | add NAME SKILLS | rm NAME")
+    p.add_argument("action", nargs="?", choices=["list", "show", "save", "add", "rm"])
+    p.add_argument("name", nargs="?")
+    p.add_argument("skills", nargs="*")
+    p.set_defaults(f=cmd_preset)
+    p = sp.add_parser("project", help=f"the project's {MANIFEST}: show | save (from what is on) | sync (install + on)")
+    p.add_argument("action", choices=["show", "save", "sync"])
+    p.add_argument("--project")
+    p.add_argument("--yes", action="store_true", help="the user agreed to installing missing skills")
+    p.add_argument("--allow-risky", action="store_true")
+    p.set_defaults(f=cmd_project)
     p = sp.add_parser("pin", help="never prune these skills")
     p.add_argument("skills", nargs="+")
     p.set_defaults(f=lambda a: cmd_pin(a, 1))
@@ -1024,14 +2911,65 @@ def main(argv=None):
     p.set_defaults(f=lambda a: cmd_pin(a, 0))
     p = sp.add_parser("remove", help="move skills from the bank to cold storage")
     p.add_argument("skills", nargs="+")
+    p.add_argument("--force", action="store_true", help="even when something references it")
     p.set_defaults(f=cmd_remove)
-    p = sp.add_parser("tidy", help="daily pass: usage, stale toggles off, cold storage, registry, leaks, cost")
+    p = sp.add_parser("tidy", help="daily pass: usage, references, stale toggles off, cold storage, registry, leaks")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--fix", action="store_true", help="re-gate skills that bypassed the gate")
     p.set_defaults(f=cmd_tidy)
-    p = sp.add_parser("reindex", help="re-read every bank skill (description, size, hash)")
+    p = sp.add_parser("harvest", help="count skill loads in every harness's session logs now")
+    p.add_argument("--reset", action="store_true", help="forget harvested counts and count every log again")
+    p.set_defaults(f=cmd_harvest)
+    p = sp.add_parser("reindex", help="re-read every bank skill (description, size, keywords, hash)")
     p.add_argument("--relane", action="store_true", help="re-guess lanes for skills still in 'general'")
     p.set_defaults(f=cmd_reindex)
+    p = sp.add_parser("scan", help="static install checks on a bank skill or a folder")
+    p.add_argument("target")
+    p.add_argument("--limit", type=int, default=40)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_scan)
+    sp.add_parser("audit", help="scan the whole bank and record each skill's risk").set_defaults(f=cmd_audit)
+    p = sp.add_parser("outdated", help="which skills have upstream changes or local edits")
+    p.add_argument("skills", nargs="*")
+    p.add_argument("--all", action="store_true", help="list current skills too")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_outdated)
+    p = sp.add_parser("diff", help="bank copy against upstream")
+    p.add_argument("skill")
+    p.set_defaults(f=cmd_diff)
+    p = sp.add_parser("update", help="take upstream changes (scanned, old copy kept in cold/)")
+    p.add_argument("skills", nargs="*")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--yes", action="store_true")
+    p.add_argument("--force", action="store_true", help="overwrite local edits")
+    p.add_argument("--allow-risky", action="store_true")
+    p.set_defaults(f=cmd_update)
+    p = sp.add_parser("remote", help="show or set the git remote the bank syncs through")
+    p.add_argument("url", nargs="?")
+    p.set_defaults(f=cmd_remote)
+    for name, fn, hlp in (("pull", cmd_pull, "merge the remote bank into this one"),
+                          ("push", cmd_push, "merge, then send this bank to the remote")):
+        p = sp.add_parser(name, help=hlp)
+        g = p.add_mutually_exclusive_group()
+        g.add_argument("--theirs", action="store_true", help="on a conflict, take the remote copy")
+        g.add_argument("--mine", action="store_true", help="on a conflict, keep this machine's copy")
+        p.set_defaults(f=fn)
+    p = sp.add_parser("agents", help="known harnesses: list | add NAME [--dir] | remove NAME")
+    p.add_argument("action", nargs="?", choices=["list", "add", "remove"])
+    p.add_argument("name", nargs="?")
+    p.add_argument("--dir")
+    p.add_argument("--no-project", action="store_true", help="do not add its project folder to project_dirs")
+    p.set_defaults(f=cmd_agents)
+    p = sp.add_parser("stats", help="usage by harness, top skills, cold candidates, suggestion hit rate")
+    p.add_argument("--days", type=int, default=30)
+    p.add_argument("--limit", type=int, default=10)
+    p.set_defaults(f=cmd_stats)
+    p = sp.add_parser("bench", help="measure the ranker on a JSONL file of {prompt, expect}")
+    p.add_argument("file")
+    p.add_argument("-k", type=int, default=3)
+    p.add_argument("--show", type=int, default=10)
+    p.set_defaults(f=cmd_bench)
+    sp.add_parser("mcp", help="serve search/suggest/use over MCP (stdio)").set_defaults(f=cmd_mcp)
     sp.add_parser("status", help="what is on, where, and what it costs").set_defaults(f=cmd_status)
     sp.add_parser("doctor", help="check the gate links and the bank").set_defaults(f=cmd_doctor)
     sp.add_parser("timer", help="install the daily tidy (systemd user timer or a cron line)").set_defaults(f=cmd_timer)
@@ -1040,4 +2978,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `skills-gate lane | head` ends quietly
     main()
