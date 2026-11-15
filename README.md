@@ -4,7 +4,7 @@
   <a href="https://github.com/T-Crypt/skills-gate/actions/workflows/test.yml"><img src="https://github.com/T-Crypt/skills-gate/actions/workflows/test.yml/badge.svg" alt="Tests"></a>
   <img src="https://img.shields.io/badge/python-3.9%2B-7ad4f2?labelColor=0a1017" alt="Python 3.9 or later">
   <img src="https://img.shields.io/badge/dependencies-none-7ee8ac?labelColor=0a1017" alt="No dependencies">
-  <img src="https://img.shields.io/badge/harnesses-16%20known-e8b56f?labelColor=0a1017" alt="16 known harnesses">
+  <img src="https://img.shields.io/badge/harnesses-33%20known-e8b56f?labelColor=0a1017" alt="33 known harnesses">
   <img src="https://img.shields.io/badge/agents-CLI%20%C2%B7%20hook%20%C2%B7%20MCP-e8b56f?labelColor=0a1017" alt="CLI, prompt hook and MCP">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-c4a1ff?labelColor=0a1017" alt="MIT licence"></a>
 </p>
@@ -22,10 +22,18 @@ the gate. When you type a task, a prompt hook ranks the bank and names the two o
 fit. The agent pulls in a full playbook only when it needs one, and a nightly pass retires what
 nobody uses.
 
+Skills you install keep changing upstream, and an agent follows whatever the new version says. Every
+night skills-gate checks each skill's source, hands the diff to a model on your own machine, and
+applies the change only when that model passed it and nothing else looks off: no new host, no
+higher scan risk, no local edits in the way. Anything else waits in quarantine with its diff, and
+`rollback` undoes an update in one command.
+
 On the machine it was built on, 148 skills cost 14,250 tokens of listing in every session. Behind the
 gate they cost 389.
 
-One Python file, standard library only, a SQLite registry. No GUI, no daemon, no model, no GPU.
+One Python file, standard library only, a SQLite registry. No GUI, no daemon. The core needs no model
+and no GPU; the optional reviewer calls a local model server you already run (any OpenAI-compatible
+endpoint), never a cloud one.
 
 ## Quick start
 
@@ -36,7 +44,7 @@ skills-gate init               # ~/.skills-gate, plus the gate skill in every ha
 skills-gate gate --dry-run     # what would move behind the gate
 skills-gate gate               # move it (undo: skills-gate ungate)
 skills-gate hook --write       # Claude Code: rank the bank on every prompt
-skills-gate timer              # nightly tidy + marketplace refresh (systemd user timer, or cron)
+skills-gate timer              # nightly tidy, updates, marketplace refresh (systemd user timer, or cron)
 skills-gate market refresh --budget 2000   # optional: validate the most popular 2,000 now (~10 min)
 ```
 
@@ -65,6 +73,9 @@ skills-gate: banked skills that match this request. If one fits, load it with
 4. **The tidy keeps score.** Every load, from any harness, counts. Skills switched on but idle for
    14 days switch off, and skills nobody has loaded in 120 days move to cold storage, unless you
    pinned them or something references them.
+5. **The night keeps them current.** The same tidy checks every skill with a known upstream. A change
+   reaches the bank only after the install scan and your local reviewer have read it; the rest waits
+   for you in quarantine.
 
 Harnesses without hooks still see the gate skill. Its body lists every lane and every skill name,
 so an agent can choose without a second call. Harnesses without a shell can use `skills-gate mcp`.
@@ -104,9 +115,36 @@ so an agent can choose without a second call. Harnesses without a shell can use 
   Scripts and docs get different rules. A high finding blocks the install until you pass
   `--allow-risky`; a remote install needs `--yes`, which an agent passes only after you agree.
   `audit` scans the whole bank and records a risk level per skill.
-- **Updates you can read first.** Remote installs record `url#path@commit`. `outdated` checks
-  upstream with `git ls-remote`, `diff` shows the change, and `update` scans the new version,
-  keeps the old copy in `cold/` and refuses to overwrite your local edits without `--force`.
+- **Archives too.** `add` takes a `.zip` or `.skill` file (a zipped skill folder, the format Claude
+  exports). Entries that would land outside the archive, and links, are refused before anything is
+  written.
+
+**Updates itself, judged locally**
+- **Every skill gets an upstream.** Remote installs record the repo, path, commit and the folder's
+  git tree id. Skills you installed with `npx skills` before skills-gate get theirs from its lock
+  file (`~/.agents/.skill-lock.json`), which records the same tree id. That id says exactly whether
+  upstream moved and whether your bank copy has local edits, with no guessing from timestamps.
+  A skill whose folder moved inside its repo is found again by name.
+- **The change is what gets reviewed.** The reviewer receives the diff against your installed copy,
+  plus the new version for context, so it judges what the update adds: a new host, a
+  download-and-run step, a credential read, an instruction to skip confirmation.
+- **Applied only on a pass.** The nightly pass (`update.nightly`: `auto`) applies an update when the
+  install scan is clean, the change adds no host you have not approved, the scan risk does not rise,
+  the bank copy has no local edits, and the local reviewer answered `pass`. Without a reviewer
+  configured, nothing is applied unattended. Up to `update.max_reviews` (10) reviews run a night;
+  the rest wait for the next one.
+- **Held with its diff.** Everything else goes to quarantine once per upstream version.
+  `quarantine show <entry>` prints why it was held, the reviewer's note and the diff;
+  `quarantine release` takes it, `quarantine rm` drops it and that version is never offered again,
+  on any peer.
+- **One-command undo.** Every update keeps the previous copy in `cold/` with a note of where it
+  came from. `rollback <skill>` restores it and skips the version you rolled back from; a newer
+  upstream version is offered as usual.
+- **By hand.** `outdated` lists what changed upstream and what you edited, `diff` shows it, and
+  `update` runs the same vetting with you deciding. `update.nightly` set to `hold` holds every
+  update for you, `check` only reports, `off` skips the pass.
+- **It tells you.** Set `notify_cmd` and a tidy that held an update or wrote a draft runs it once
+  with a one-line summary (`notify-send`, a phone push, anything that takes an argument).
 
 **Never calls out without approval**
 - **Egress needs your yes.** Every bank skill is scanned for the hosts it would dial. The default
@@ -167,9 +205,11 @@ so an agent can choose without a second call. Harnesses without a shell can use 
   before the tidy and pushes after it, and an hourly push keeps peers in step during the day; a
   push with nothing new makes no commit. Secrets (`.env`, keys, tokens) and files
   over 10 MB stay home, and an empty remote never empties your bank.
-- **16 known harnesses.** `agents` lists Claude Code, the shared `~/.agents` folder, Codex,
-  OpenCode, Pi, OMP, Cursor, Gemini, Copilot, Windsurf, Roo, Cline, Goose, Kiro, Qwen and Trae,
-  with what is installed and what is gated. `agents add cursor` gates one more.
+- **33 known harnesses.** `agents` lists the ones on this machine (Claude Code, the shared
+  `~/.agents` folder, Codex, OpenCode, Pi, OMP, Cursor, Gemini, Copilot, Windsurf, Roo, Cline,
+  Goose, Kiro, Qwen, Trae, Amp, Antigravity, Droid, Continue, Crush and more), with what is
+  installed and what is gated; `--all` shows the rest. `agents add cursor` gates one more. The
+  folders added in 0.5 come from skills-manager's adapter table.
 - **MCP.** `skills-gate mcp` serves `skills_suggest`, `skills_use`, `skills_search`, `skills_lane`,
   `skills_show`, `skills_on` and `skills_off` over stdio. Skip it in harnesses with a shell: the
   CLI costs no context until called, and seven tool schemas do.
@@ -225,13 +265,15 @@ inverts the default. Nothing loads until a task needs it.
 | Retires unused skills | from usage in 4 harnesses' logs | not listed | no such command |
 | Marketplace | local catalog of 20k skills, validated nightly | browse skills.sh | `search` (GitHub code search) |
 | Scan before install | yes, blocks high findings | not listed | `preview` to read first |
-| Updates | `outdated` / `diff` / `update` | upstream check | `update` |
+| Updates | nightly, applied only after a local model passes the diff; held otherwise; `rollback` | scheduled check, optional auto-apply without a content review | `update` |
+| Skills installed by other tools | upstream recovered from the `npx skills` lock file | `adopt` | not listed |
 | Multi-machine | git push / pull, merge per skill | git backup and sync | not listed |
 | Interface | CLI, hook, MCP | desktop app + CLI | CLI |
-| Agents | 16 known, any folder | 56 built in | Copilot, Claude Code, Cursor, Codex, Gemini CLI, Antigravity |
+| Agents | 33 known, any folder | 56 built in | Copilot, Claude Code, Cursor, Codex, Gemini CLI, Antigravity |
 
-Pick skills-manager for a GUI and the widest agent list. Pick skills-gate when context cost and
-choosing the right skill matter more than seeing every skill at once. They can share a machine:
+Pick skills-manager for a GUI and the widest agent list. Pick skills-gate when context cost,
+choosing the right skill, and knowing what changed in a skill before your agent follows it matter
+more than seeing every skill at once. They can share a machine:
 `skills-gate adopt <its library folder>` banks its library.
 
 ## Commands
@@ -246,13 +288,14 @@ choosing the right skill matter more than seeing every skill at once. They can s
 | `on` / `off <skills> [--lane L] [--preset P] [--global] [--save]` | Link skills into a project or every harness |
 | `search <words> [--market] [--live] [--offline]` | Search the bank, the validated catalog, or the marketplaces live |
 | `market [refresh \| new \| show \| validate \| stats]` | The marketplace catalog: gather, validate, browse |
-| `add <folder \| git-url \| owner/repo[/path][:skill][@ref]>` | Install: scan, ask, bank. `--yes`, `--allow-risky`, `--only`, `--link`, `--lane` |
+| `add <folder \| .zip \| .skill \| git-url \| owner/repo[/path][:skill][@ref]>` | Install: scan, ask, bank. `--yes`, `--allow-risky`, `--only`, `--link`, `--lane` |
 | `adopt <folders>` | Bank every skill already sitting in existing folders |
 | `scan <skill \| folder>` / `audit` | Install checks on one skill / on the whole bank |
 | `net [list \| allow \| revoke \| hosts]` | Which skills call out, and what you approved |
 | `review <skills \| --all \| --changed> [--static]` | Vet bank skills again: scan, egress, reviewer |
-| `quarantine [list \| release \| rm]` | Skills held back by vetting |
+| `quarantine [list \| show \| release \| rm]` | Skills and updates held back by vetting; `show` prints the reasons and the diff |
 | `outdated` / `diff <skill>` / `update <skills \| --all>` | Upstream changes, read them, take them |
+| `rollback <skill>` | Restore the copy from before the last update and skip that version |
 | `project show \| save \| sync` | The project's `.skills-gate.json` |
 | `preset list \| show \| save \| add \| rm` | Named skill sets |
 | `remote <url>` / `push` / `pull [--theirs \| --mine]` | Sync the bank through git |
@@ -260,7 +303,7 @@ choosing the right skill matter more than seeing every skill at once. They can s
 | `agents [add \| remove \| ignore] <name>` | Known harnesses and which ones are gated; `ignore` hides one for good |
 | `lane [name]` / `set-lane <lane> <skills>` | Read or change the lanes |
 | `pin` / `unpin` / `remove <skills>` | Exempt from pruning / move to cold storage |
-| `tidy [--fix] [--dry-run]` | The nightly pass; `--fix` re-gates leaks |
+| `tidy [--fix] [--dry-run] [--no-updates]` | The nightly pass, updates included; `--fix` re-gates leaks |
 | `harvest [--reset]` | Count skill loads from session logs now; `--reset` recounts everything |
 | `stats [--days N]` / `bench <file>` | Usage, trust events and suggestion hit rate / ranker quality on your prompts |
 | `status` / `doctor` / `show <skill>` | Inspect |
@@ -287,7 +330,10 @@ to leave it alone.
   "trust": {"egress": "deny", "allow_hosts": [], "review_cmd": "", "review_timeout": 600,
             "review_pending": "allow", "nightly_review": 20},
   "distill": {"days": 14, "every_days": 7, "min_sessions": 5, "min_projects": 2, "max_drafts": 3,
-              "draft_cmd": "skills-gate-draft", "ignore": ["^kubectl get"]}
+              "draft_cmd": "skills-gate-draft", "ignore": ["^kubectl get"]},
+  "update": {"nightly": "auto", "max_reviews": 10},
+  "lockfiles": ["~/.agents/.skill-lock.json"],
+  "notify_cmd": "notify-send skills-gate"
 }
 ```
 
@@ -304,6 +350,12 @@ against a candidate's command shapes. `draft_cmd` gets the candidate as JSON on 
 a SKILL.md; the bundled `skills-gate-draft` reads `SKILLS_GATE_LLM_URL` and
 `SKILLS_GATE_DRAFT_MODEL` (default `agent`).
 
+`update.nightly` is `auto` (apply what passes, hold the rest), `hold`, `check` or `off`. The
+reviewer gets `SKILLS_GATE_DIFF`, a file with the change against the installed copy; a reviewer
+command that ignores it still works and judges the whole new version. `lockfiles` lists other
+installers' lock files to take sources from; set it to `[]` to ignore them. `notify_cmd` gets one
+argument and runs at most once per tidy.
+
 ## Layout
 
 ```
@@ -311,7 +363,7 @@ a SKILL.md; the bundled `skills-gate-draft` reads `SKILLS_GATE_LLM_URL` and
   config.json        harness folders, always-on skills, sources, thresholds
   gate.db            registry: skills, lanes, usage, toggles, references, presets, events, the catalog
   bank/<skill>/      every skill (copies, or links to their source)
-  cold/<skill>/      removed, pruned and replaced skills
+  cold/<skill>/      removed, pruned and replaced skills; <skill>.pre-update-* copies feed `rollback`
   gated/             what `gate` moved, for `ungate`
   lanes/<lane>.md    one line per skill, read by `skills-gate lane`
   skill/skills-gate/ the gate skill, linked into every harness folder
@@ -326,7 +378,7 @@ Set `SKILLS_GATE_HOME` to keep it somewhere else.
 
 Everything stays on your machine except what you ask for: `market refresh` downloads the skills.sh
 sitemaps and reads public repos from GitHub (no query of yours leaves), `search --market --live`
-sends the query to skills.sh and GitHub, `add` and `outdated` talk to the git hosts you install from, and `push` sends
+sends the query to skills.sh and GitHub, `add`, `outdated` and the nightly update check talk to the git hosts your skills came from, and `push` sends
 your bank to the remote you set. Use a private repo for that remote.
 
 ## Tests
@@ -335,7 +387,7 @@ your bank to the remote you set. Use a private repo for that remote.
 python3 -m unittest discover -s tests
 ```
 
-33 end-to-end tests run every command in a throwaway home with fake harness folders, local git
+60 end-to-end tests run every command in a throwaway home with fake harness folders, local git
 repos as upstreams, a bare repo as the sync remote, and a faked GitHub for the catalog. CI runs them on Python 3.9 and 3.13.
 
 ## License

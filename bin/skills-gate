@@ -38,7 +38,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 HOME = Path(os.environ.get("SKILLS_GATE_HOME", Path.home() / ".skills-gate")).expanduser()
 BANK, COLD, GATED = HOME / "bank", HOME / "cold", HOME / "gated"
 DB, CONFIG, LANES_DIR = HOME / "gate.db", HOME / "config.json", HOME / "lanes"
@@ -98,6 +98,18 @@ DEFAULT_CONFIG = {
     # draft_cmd: optional writer (gets the candidate JSON on stdin, prints SKILL.md); bundled: skills-gate-draft.
     "distill": {"days": 14, "every_days": 7, "min_sessions": 5, "min_projects": 2, "max_drafts": 3, "draft_cmd": "",
                 "draft_timeout": 600, "ignore": []},
+    # Nightly updates, judged locally. Every skill with a known upstream is checked each night; a change is applied
+    # only when the install scan is clean, it adds no host and raises no risk, the bank copy has no local edits,
+    # and the local reviewer (trust.review_cmd) read the diff and passed it. Anything else waits in quarantine.
+    # nightly: auto (apply what passes, hold the rest), hold (hold every update for you), check (report), off.
+    # max_reviews: reviewer calls per night; the rest wait for the next night.
+    "update": {"nightly": "auto", "max_reviews": 10},
+    # Lock files other installers keep (`npx skills` writes ~/.agents/.skill-lock.json); a bank skill with no
+    # recorded upstream takes its source from them, so skills you installed before skills-gate update too.
+    "lockfiles": ["~/.agents/.skill-lock.json"],
+    # Run once at the end of a tidy that left something for you to decide (held updates, new drafts). Gets one
+    # argument, a short summary line. Example: "notify-send skills-gate".
+    "notify_cmd": "",
 }
 
 # Known harnesses: global skill folder, project folder, session logs. Paths are each tool's documented or usual
@@ -124,6 +136,24 @@ KNOWN_AGENTS = {
     "kiro":     {"home": "~/.kiro", "global": "~/.kiro/skills", "project": ".kiro/skills"},
     "qwen":     {"home": "~/.qwen", "global": "~/.qwen/skills", "project": ".qwen/skills"},
     "trae":     {"home": "~/.trae", "global": "~/.trae/skills", "project": ".trae/skills"},
+    # From xingkongliang/skills-manager's adapter table (MIT): global folders only, no project folder known.
+    "amp":      {"home": "~/.config/agents", "global": "~/.config/agents/skills"},
+    "antigravity": {"home": "~/.gemini/antigravity", "global": "~/.gemini/config/skills"},
+    "augment":  {"home": "~/.augment", "global": "~/.augment/skills"},
+    "codebuddy": {"home": "~/.codebuddy", "global": "~/.codebuddy/skills"},
+    "continue": {"home": "~/.continue", "global": "~/.continue/skills"},
+    "crush":    {"home": "~/.config/crush", "global": "~/.config/crush/skills"},
+    "droid":    {"home": "~/.factory", "global": "~/.factory/skills"},
+    "grok":     {"home": "~/.grok", "global": "~/.grok/skills"},
+    "hermes":   {"home": "~/.hermes", "global": "~/.hermes/skills"},
+    "iflow":    {"home": "~/.iflow", "global": "~/.iflow/skills"},
+    "junie":    {"home": "~/.junie", "global": "~/.junie/skills"},
+    "kilo":     {"home": "~/.kilocode", "global": "~/.kilocode/skills"},
+    "kimi":     {"home": "~/.kimi-code", "global": "~/.kimi-code/skills", "project": ".kimi-code/skills"},
+    "openclaw": {"home": "~/.openclaw", "global": "~/.openclaw/skills"},
+    "openhands": {"home": "~/.openhands", "global": "~/.openhands/skills"},
+    "qoder":    {"home": "~/.qoder", "global": "~/.qoder/skills"},
+    "vibe":     {"home": "~/.vibe", "global": "~/.vibe/skills"},
 }
 
 # Lane guesses for skills added without one. Order matters: first match wins.
@@ -211,7 +241,8 @@ def confirm(question: str, yes: bool) -> bool:
 
 
 SKILL_COLS = {"keywords": "text not null default ''", "orig_hash": "text not null default ''",
-              "ref": "text not null default ''", "risk": "text not null default ''"}
+              "ref": "text not null default ''", "risk": "text not null default ''",
+              "up_tree": "text not null default ''"}  # git tree id of the upstream folder the bank copy came from
 
 
 def db(timeout: float = 15) -> sqlite3.Connection:
@@ -241,6 +272,8 @@ def db(timeout: float = 15) -> sqlite3.Connection:
         notes text not null default '');
     create table if not exists distill (fp text primary key, name text not null, status text not null,
         at integer not null, shapes text not null default '[]');
+    create table if not exists update_skip (skill text not null, hash text not null, at integer not null,
+        primary key (skill, hash));
     create index if not exists events_skill on events (skill, at);
     """)
     have = {r[1] for r in c.execute("pragma table_info(skills)")}
@@ -382,14 +415,18 @@ def in_bank(name: str) -> bool:
     return p.exists() or p.is_symlink()
 
 
-def keep_copy(name: str, tag: str) -> Path:
-    """Copy a bank skill to cold/<name>.<tag>-<time> before it is replaced (unique even within one second)."""
+def keep_copy(name: str, tag: str, row=None) -> Path:
+    """Copy a bank skill to cold/<name>.<tag>-<time> before it is replaced (unique even within one second). With the
+    registry row, cold/<copy>.origin.json records where that copy came from, so `rollback` can restore it whole."""
     COLD.mkdir(parents=True, exist_ok=True)
     base = COLD / f"{name}.{tag}-{time.strftime('%Y%m%d-%H%M%S')}"
     dst, i = base, 1
-    while dst.exists() or dst.is_symlink():
+    while dst.exists() or dst.is_symlink() or Path(f"{dst}.origin.json").exists():
         dst, i = Path(f"{base}-{i}"), i + 1
     shutil.copytree(bank_path(name), dst, symlinks=True)
+    if row is not None:
+        Path(f"{dst}.origin.json").write_text(json.dumps(
+            {k: row[k] for k in ("source", "ref", "up_tree", "orig_hash", "lane")} | {"at": now()}, indent=1))
     return dst
 
 
@@ -401,7 +438,8 @@ def rm(p: Path):
 
 
 def register(c, src: Path, lane: str | None = None, link: bool = False, source: str = "", force: bool = False,
-             name: str | None = None, ref: str = "", kind: str = "add", meta: dict | None = None) -> str | None:
+             name: str | None = None, ref: str = "", kind: str = "add", meta: dict | None = None,
+             up_tree: str = "") -> str | None:
     """Put one skill dir into the bank (copy, or a symlink to its source with link=True) and the registry."""
     fm = frontmatter(src / "SKILL.md")
     name = name or fm.get("name") or src.name
@@ -429,10 +467,10 @@ def register(c, src: Path, lane: str | None = None, link: bool = False, source: 
     h = tree_hash(dst)
     risk = scan_level(scan_tree(dst))
     c.execute("insert or replace into skills (name, lane, description, source, link, hash, tokens, pinned, added_at,"
-              " last_used, uses, keywords, orig_hash, ref, risk) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              " last_used, uses, keywords, orig_hash, ref, risk, up_tree) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
               (name, lane, desc, source or str(src), int(link), h, est_tokens(dst / "SKILL.md"), int(pinned),
                row["added_at"] if row else now(), row["last_used"] if row else None, row["uses"] if row else 0,
-               body_keywords(dst / "SKILL.md"), h, ref, risk))
+               body_keywords(dst / "SKILL.md"), h, ref, risk, "" if link else up_tree or meta.get("up_tree", "")))
     event(c, name, kind, source or str(src))
     say(f"[{kind:<5}] {name}  lane={lane}{'  (linked)' if link else ''}{f'  risk={risk}' if risk else ''}")
     return name
@@ -698,7 +736,7 @@ global folders by hand: the daily `tidy` removes anything that bypasses the gate
 Local first: a skill never calls out. Do not run a skill's command or script that reaches an external host
 unless the user approved that host (`skills-gate net` lists approvals; `use` prints a NETWORK NOT APPROVED
 notice when a skill has none). Local and tailnet addresses are fine. Never pass --allow-net or --allow-risky
-yourself; only the user decides those.
+yourself, and never `quarantine release` a held skill or update; only the user decides those.
 
 ## Lanes
 """
@@ -909,6 +947,27 @@ def fetch_repo(url: str, ref: str, td: Path, commit: str = "") -> tuple[Path, st
     return dst, head
 
 
+def git_tree_at(d: Path) -> str:
+    """The git tree id of folder d at HEAD of the clone it sits in ('' outside a clone). Same id GitHub and the
+    `npx skills` lock file record, so a bank copy can be matched to the exact upstream folder it came from."""
+    if not (d / ".git").exists() and git_run(["rev-parse", "--is-inside-work-tree"], cwd=d).returncode != 0:
+        return ""
+    r = git_run(["rev-parse", "HEAD:./"], cwd=d)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def git_tree_of(d: Path) -> str:
+    """The git tree id a folder's current content would have (a throwaway index, nothing written to d)."""
+    with tempfile.TemporaryDirectory(prefix="skills-gate-tree-") as td:
+        base = ["-c", "core.autocrlf=false", "-c", "core.filemode=true", f"--git-dir={td}/g/.git", f"--work-tree={d}"]
+        if git_run(["init", "-q", f"{td}/g"]).returncode != 0:
+            return ""
+        if git_run(base + ["add", "-A", "-f", "."], cwd=d).returncode != 0:
+            return ""
+        r = git_run(base + ["write-tree"], cwd=d)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def install_dirs(c, dirs: list[Path], *, remote: bool, yes: bool, allow_risky: bool, lane=None, link=False,
                  force=False, source_of=lambda d: "", ref="", only=None, allow_net=False) -> list[str]:
     """Quarantine, vet, ask, register. A skill linked from your own folder is vetted in place; everything else is
@@ -920,7 +979,7 @@ def install_dirs(c, dirs: list[Path], *, remote: bool, yes: bool, allow_risky: b
     staged = []
     for d in chosen:
         name = frontmatter(d / "SKILL.md").get("name") or d.name
-        meta = {"source": source_of(d), "ref": ref, "lane": lane}
+        meta = {"source": source_of(d), "ref": ref, "lane": lane, "up_tree": git_tree_at(d) if remote else ""}
         here = d if link else quarantine(d, name)
         rep = vet(c, cfg, here, name, allow_risky=allow_risky, allow_net=allow_net)
         if rep["ok"] or link:  # a link to your own folder is reported, never blocked; `use` still enforces egress
@@ -940,7 +999,7 @@ def install_dirs(c, dirs: list[Path], *, remote: bool, yes: bool, allow_risky: b
     added = []
     for d, here, name, rep, meta in staged:
         n = register(c, d if link else here, lane, link=link, force=force, source=meta["source"], ref=ref,
-                     name=name)
+                     name=name, up_tree=meta["up_tree"])
         if n:
             record_review(c, n, rep)
             added.append(n)
@@ -1033,15 +1092,18 @@ def approve_net(c, name: str, hosts: list[str], why: str = "user"):
     event(c, name, "net-allow", ",".join(hosts))
 
 
-def run_reviewer(cfg, path: Path, name: str) -> dict:
+def run_reviewer(cfg, path: Path, name: str, diff: Path | None = None) -> dict:
     """The optional reviewer: trust.review_cmd gets the skill folder; its last stdout line is JSON with a verdict
-    (pass | warn | fail | skipped) and notes. It must read the skill, never run it."""
+    (pass | warn | fail | skipped) and notes. It must read the skill, never run it. For an update, SKILLS_GATE_DIFF
+    names a file with the change against the installed copy, so the reviewer can judge what the change adds."""
     cmd = cfg["trust"].get("review_cmd")
     if not cmd:
         return {"verdict": "none", "notes": "no reviewer configured"}
     try:
         argv = [os.path.expanduser(x) for x in (cmd if isinstance(cmd, list) else cmd.split())] + [str(path), name]
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=int(cfg["trust"].get("review_timeout", 600)))
+        env = dict(os.environ, SKILLS_GATE_DIFF=str(diff)) if diff else None
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=int(cfg["trust"].get("review_timeout", 600)),
+                           env=env)
         line = next((ln for ln in reversed(r.stdout.strip().splitlines()) if ln.strip().startswith("{")), "")
         out = json.loads(line) if line else {"verdict": "error", "notes": short(r.stderr or r.stdout, 200)}
     except (OSError, ValueError, subprocess.TimeoutExpired) as e:
@@ -1052,7 +1114,7 @@ def run_reviewer(cfg, path: Path, name: str) -> dict:
 
 
 def vet(c, cfg, path: Path, name: str, *, allow_risky=False, allow_net=False, review=True, quiet=False,
-        egress_gate=True) -> dict:
+        egress_gate=True, diff: Path | None = None) -> dict:
     """The gate every new or changed skill passes: install scan, egress against approvals, the reviewer.
     Returns a report with ok=True only when nothing blocks it."""
     findings = scan_tree(path)
@@ -1061,7 +1123,7 @@ def vet(c, cfg, path: Path, name: str, *, allow_risky=False, allow_net=False, re
     if allow_net and (eg["hosts"] or eg["unknown"] or eg["telemetry"]):
         approve_net(c, name, list(eg["hosts"]) + (["?"] if eg["unknown"] or eg["telemetry"] else []), "--allow-net")
     need = unapproved(c, cfg, name, eg)
-    rev = run_reviewer(cfg, path, name) if review else {"verdict": "none", "notes": ""}
+    rev = run_reviewer(cfg, path, name, diff) if review else {"verdict": "none", "notes": ""}
     blocks = []
     if level == "high" and not allow_risky:
         blocks.append("high-risk scan findings (--allow-risky after reading them)")
@@ -1213,11 +1275,38 @@ def cmd_quarantine(a):
         say(f"{len(entries)} held in {qdir}" + ("; release: skills-gate quarantine release <entry> [--allow-net]"
                                                  " [--allow-risky]" if entries else ""))
         return
+    if a.action == "show":
+        for name in a.entries:
+            e = qdir / name
+            rp = e / ".skills-gate-report.json"
+            if not rp.is_file():
+                die(f"no quarantined skill {name}")
+            rep = json.loads(rp.read_text())
+            meta = rep.get("meta", {})
+            say(f"{name}: {'update to ' + rep.get('name', '') if meta.get('update') else 'new skill'}"
+                f"  from {meta.get('source') or '-'}")
+            for b in rep.get("blocks", []):
+                say(f"  held: {b}")
+            rv = rep.get("review") or {}
+            if rv.get("verdict") not in (None, "none"):
+                say(f"  reviewer: {rv['verdict']} - {rv.get('notes', '')}")
+            if rep.get("diff"):
+                say("")
+                sys.stdout.write(rep["diff"])
+            say(f"\ntake it: skills-gate quarantine release {name}   drop it: skills-gate quarantine rm {name}")
+        return
     if a.action == "rm":
+        c = db()
         for e in entries:
             if a.all or e.name in a.entries:
+                rp = e / ".skills-gate-report.json"
+                rep = json.loads(rp.read_text()) if rp.is_file() else {}
+                if rep.get("meta", {}).get("update") and rep.get("name"):
+                    skip_version(c, rep["name"], held_hash(e), "dropped from quarantine")
                 rm(e)
-                say(f"[rm]    {e.name}")
+                say(f"[rm]    {e.name}" + ("  (that upstream version will not be offered again)"
+                                           if rep.get("meta", {}).get("update") else ""))
+        c.commit()
         return
     c = db()
     cfg = config()
@@ -1234,8 +1323,10 @@ def cmd_quarantine(a):
             say(f"[held]  {name} stays in quarantine")
             continue
         (e / ".skills-gate-report.json").unlink(missing_ok=True)
+        if meta.get("update") and in_bank(skill):
+            keep_copy(skill, "pre-update", get(c, skill))
         register(c, e, meta.get("lane"), force=True, source=meta.get("source", str(e)), ref=meta.get("ref", ""),
-                 name=skill, kind="release")
+                 name=skill, kind="release", up_tree=meta.get("up_tree", ""))
         record_review(c, skill, res)
         rm(e)
     write_registry(c, cfg)
@@ -1267,17 +1358,48 @@ def cmd_init(a):
     say("next: `skills-gate gate --dry-run` to see what would move behind the gate; `skills-gate agents` for more")
 
 
+def unpack_archive(archive: Path, dst: Path):
+    """A .zip or .skill (a zipped skill folder, as Claude exports them) into dst. Refuses entries that would land
+    outside dst, links, and archives over 200 MB unpacked; nothing in it runs."""
+    import stat
+    import zipfile
+    try:
+        z = zipfile.ZipFile(archive)
+    except (zipfile.BadZipFile, OSError) as e:
+        die(f"{archive}: not a readable zip archive ({e})")
+    with z:
+        if sum(i.file_size for i in z.infolist()) > 200_000_000:
+            die(f"{archive}: over 200 MB unpacked; not a skill")
+        root = dst.resolve()
+        for i in z.infolist():
+            target = (dst / i.filename).resolve()
+            if root not in target.parents and target != root:
+                die(f"{archive}: entry {i.filename!r} points outside the archive; refused")
+            if stat.S_ISLNK(i.external_attr >> 16):
+                die(f"{archive}: entry {i.filename!r} is a link; refused")
+        z.extractall(dst)
+
+
 def cmd_add(a):
     c = db()
     cfg = config()
     src = a.source
     added = []
-    if Path(src).expanduser().exists():
+    if Path(src).expanduser().is_file() and Path(src).suffix.lower() in (".zip", ".skill"):
+        arc = Path(src).expanduser().resolve()
+        with tempfile.TemporaryDirectory(prefix="skills-gate-zip-") as td:
+            unpack_archive(arc, Path(td))
+            dirs = find_skill_dirs(Path(td))
+            if not dirs:
+                die(f"no SKILL.md found in {src}")
+            added = install_dirs(c, dirs, remote=False, yes=True, allow_risky=a.allow_risky, lane=a.lane,
+                                 force=a.force, only=a.only, allow_net=a.allow_net, source_of=lambda d: str(arc))
+    elif Path(src).expanduser().exists():
         dirs = find_skill_dirs(Path(src))
         if not dirs:
             die(f"no SKILL.md found in {src}")
         added = install_dirs(c, dirs, remote=False, yes=True, allow_risky=a.allow_risky, lane=a.lane, link=a.link,
-                             force=a.force, only=a.only, allow_net=a.allow_net)
+                             force=a.force, only=a.only, allow_net=a.allow_net, source_of=lambda d: str(d.resolve()))
     else:
         catalog_tables(c)
         bad = c.execute("select * from market where status='fail' and (id=? or repo||'/'||path=? or"
@@ -2504,6 +2626,16 @@ def cmd_tidy(a):
                 rm(q)
     if not dry:
         reindex(c)
+    upd = {"applied": [], "held": [], "gone": []}
+    if not dry and getattr(a, "updates", True):
+        upd = update_pass(c, cfg)
+        if upd.get("recovered"):
+            say(f"[update] {upd['recovered']} skill(s) got their upstream from an installer's lock file")
+        say(f"[update] {upd['checked']} skill(s) with an upstream checked: {len(upd['applied'])} updated,"
+            f" {len(upd['held'])} held for you" + (f", {upd['waiting']} still waiting in quarantine"
+                                                   if upd.get("waiting") else "")
+            + (f", {upd['deferred']} left for tomorrow" if upd["deferred"] else "")
+            + (f"; gone upstream: {', '.join(upd['gone'][:6])}" if upd["gone"] else ""))
     changed = changed_since_review(c)
     if changed and not dry and cfg["trust"].get("review_cmd"):
         cap = int(cfg["trust"].get("nightly_review", 20))
@@ -2513,6 +2645,7 @@ def cmd_tidy(a):
     elif changed:
         say("[review] " + ", ".join(r["name"] for r in changed[:10]) + (", ..." if len(changed) > 10 else "")
             + " never reviewed or changed since; run `skills-gate review --changed`")
+    made = []
     every = int(cfg["distill"].get("every_days", 7))
     if every > 0 and not dry and now() - int(meta_get(c, "distill_at", "0")) >= every * DAY:
         _, made = distill_run(c, cfg, quiet=True)
@@ -2522,6 +2655,14 @@ def cmd_tidy(a):
     waiting = c.execute("select count(*) from distill where status='draft'").fetchone()[0]
     if waiting:
         say(f"[distill] {waiting} draft(s) wait for you: skills-gate distill show NAME, then accept or reject")
+    news = []
+    if upd["held"]:
+        news.append(f"{len(upd['held'])} skill update(s) held ({', '.join(upd['held'][:3])}):"
+                    " skills-gate quarantine list")
+    if made:
+        news.append(f"{len(made)} new skill draft(s): skills-gate distill list")
+    if news and not dry:
+        notify(cfg, "skills-gate: " + "; ".join(news))
     keep = always_on(cfg)
     leaks = [(h, e.name) for h, d in harness_dirs(cfg).items() for e in d.iterdir()
              if not e.name.startswith(".") and e.name not in keep and (e / "SKILL.md").is_file()
@@ -2542,6 +2683,18 @@ def cmd_tidy(a):
     say("always-loaded skill listing per harness (tokens): " + ", ".join(f"{k} {v}" for k, v in cost.items()))
     say(f"gate skill body ~{gate_tok} tok; bank {c.execute('select count(*) from skills').fetchone()[0]} skills, "
         f"{bank_bytes / 1e6:.1f} MB; db {DB.stat().st_size / 1e3:.0f} kB")
+
+
+def notify(cfg, msg: str):
+    """notify_cmd gets one summary line when a tidy leaves something for the user. Never fails the tidy."""
+    cmd = cfg.get("notify_cmd")
+    if not cmd:
+        return
+    try:
+        argv = [os.path.expanduser(x) for x in (cmd if isinstance(cmd, list) else shlex.split(cmd))] + [msg]
+        subprocess.run(argv, capture_output=True, timeout=60)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        warn(f"notify_cmd failed: {e}")
 
 
 def reindex(c, relane: bool = False) -> int:
@@ -2588,6 +2741,10 @@ def cmd_stats(a):
     tr = {k: n for k, n in c.execute("select kind, count(*) from events where kind in"
                                       " ('net-block','net-allow','net-revoke','held') and at>=? group by kind", (since,))}
     say("trust: " + (", ".join(f"{k} {v}" for k, v in sorted(tr.items())) or "nothing blocked, nothing approved"))
+    up = {k: n for k, n in c.execute("select kind, count(*) from events where kind in ('auto-update', 'update',"
+                                      " 'update-held', 'update-skip', 'rollback') and at>=? group by kind", (since,))}
+    if up:
+        say("updates: " + ", ".join(f"{k} {v}" for k, v in sorted(up.items())))
     revs = c.execute("select verdict, count(*) n from reviews where verdict<>'none' and at>=? group by verdict"
                      " order by n desc", (since,)).fetchall()
     if revs:
@@ -2771,6 +2928,44 @@ def cmd_audit(a):
 
 # ---------------------------------------------------------------------------------------------------- updates
 
+def recover_sources(c, cfg) -> int:
+    """Bank skills with no recorded upstream take one from another installer's lock file (`npx skills` keeps
+    ~/.agents/.skill-lock.json: repo URL, folder path, git tree id). Nothing is fetched; returns how many."""
+    n = 0
+    for lf in cfg.get("lockfiles") or []:
+        try:
+            lock = json.loads(Path(lf).expanduser().read_text()).get("skills", {})
+        except (OSError, ValueError, AttributeError):
+            continue
+        for name, ent in lock.items() if isinstance(lock, dict) else ():
+            url, path = (ent or {}).get("sourceUrl", ""), (ent or {}).get("skillPath", "")
+            if not ("://" in url or url.startswith("git@")) or not path.endswith("SKILL.md"):
+                continue
+            row = c.execute("select source, link from skills where name=?", (name,)).fetchone()
+            if not row or row["link"] or parse_source(row["source"]):
+                continue
+            rel = str(Path(path).parent)
+            c.execute("update skills set source=?, ref='', up_tree=? where name=?",
+                      (f"{url}#{'.' if rel in ('', '.') else rel}@", ent.get("skillFolderHash", ""), name))
+            event(c, name, "provenance", f"{url} {rel} (from {Path(lf).name})")
+            n += 1
+    return n
+
+
+def relocate(repo: Path, name: str):
+    """A skill whose folder moved upstream: the one folder (hidden ones included) named for it, or whose SKILL.md
+    names it. None when there is no such folder or more than one with different content."""
+    hits = []
+    for dirpath, dirnames, filenames in os.walk(repo):
+        dirnames[:] = [d for d in dirnames if d != ".git" and d not in SKIP_PARTS]
+        if "SKILL.md" in filenames:
+            d = Path(dirpath)
+            if d.name == name or frontmatter(d / "SKILL.md").get("name") == name:
+                hits.append(d)
+    trees = {git_tree_at(d) or tree_hash(d) for d in hits}
+    return hits[0] if hits and len(trees) == 1 else None
+
+
 def upstream_of(row, td: Path, cache: dict):
     """Fetch the latest upstream copy of a skill: (state, dir or None, new source string)."""
     if row["link"]:
@@ -2792,40 +2987,66 @@ def upstream_of(row, td: Path, cache: dict):
     if commit and ent["head"].startswith(commit):
         return "same", None, ""
     if ent["repo"] is None:
-        ent["repo"], ent["short"] = fetch_repo(url, row["ref"], td)
+        try:
+            ent["repo"], ent["short"] = fetch_repo(url, row["ref"], td)
+        except SystemExit:
+            ent["head"] = ""
+            return "unreachable", None, ""
     repo, head = ent["repo"], ent["short"]
     d = repo / rel if rel else repo
     if not (d / "SKILL.md").is_file():
-        return "gone", None, ""
+        d = relocate(repo, row["name"])
+        if d is None:
+            return "gone", None, ""
+        rel = str(d.relative_to(repo))
     return "remote", d, f"{url}#{rel or '.'}@{head}"
 
 
-def check_updates(c, names: list[str], td: Path) -> list[dict]:
-    rows = [get(c, n) for n in names] if names else c.execute("select * from skills order by name").fetchall()
+def check_updates(c, names: list[str], td: Path, rows=None) -> list[dict]:
+    """Every named skill (all by default) against its upstream. A skill with a known upstream tree id is judged
+    exactly: upstream changed when its tree differs from the recorded one, edited here when the bank copy's tree
+    does. Others fall back to the content hash taken when the skill entered the bank."""
+    rows = rows if rows is not None else [get(c, n) for n in names] if names else \
+        c.execute("select * from skills order by name").fetchall()
     cache, out = {}, []
     for r in rows:
         bank = bank_path(r["name"])
-        edited = bool(r["orig_hash"]) and (bank / "SKILL.md").is_file() and tree_hash(bank) != r["orig_hash"]
         kind, new_dir, new_src = upstream_of(r, td, cache)
+        cur = git_tree_at(new_dir) if kind == "remote" else ""
+        if r["up_tree"] and (bank / "SKILL.md").is_file() and not r["link"]:
+            edited = git_tree_of(bank) != r["up_tree"]
+        else:
+            edited = bool(r["orig_hash"]) and (bank / "SKILL.md").is_file() and tree_hash(bank) != r["orig_hash"]
         state = {"linked": "linked", "no-source": "no source", "unreachable": "unreachable", "same": "current",
                  "gone": "gone upstream"}.get(kind)
         if state is None:
-            state = "current" if tree_hash(new_dir) == r["orig_hash"] else "update"
+            same = cur == r["up_tree"] if cur and r["up_tree"] else tree_hash(new_dir) == r["orig_hash"]
+            state = "current" if same else "update"
+            if same and kind == "remote" and new_src != r["source"]:
+                # nothing new in the folder: remember the commit (or its new place) so tomorrow is one ls-remote
+                c.execute("update skills set source=?, up_tree=? where name=?",
+                          (new_src, cur or r["up_tree"], r["name"]))
         out.append({"name": r["name"], "state": state, "edited": edited, "dir": new_dir, "source": new_src,
-                    "ref": r["ref"], "row": r})
+                    "ref": r["ref"], "row": r, "up_tree": cur,
+                    "moved": kind == "remote" and parse_source(new_src)[1] != parse_source(r["source"])[1]
+                    if parse_source(r["source"]) else False})
     return out
 
 
 def cmd_outdated(a):
     c = db()
+    if recover_sources(c, config()):
+        c.commit()
     with tempfile.TemporaryDirectory(prefix="skills-gate-") as td:
         res = check_updates(c, a.skills, Path(td))
+    c.commit()
     shown = [e for e in res if a.all or e["state"] not in ("current", "linked", "no source") or e["edited"]]
     if a.json:
         say(json.dumps([{k: e[k] for k in ("name", "state", "edited", "source")} for e in shown], indent=1))
         return
     for e in shown:
-        say(f"{e['name']:<32} {e['state']:<14}{'  edited here' if e['edited'] else ''}")
+        say(f"{e['name']:<32} {e['state']:<14}{'  edited here' if e['edited'] else ''}"
+            f"{'  moved upstream' if e['moved'] else ''}")
     ups = sum(e["state"] == "update" for e in res)
     say(f"{ups} update(s) available, {sum(e['edited'] for e in res)} edited here, "
         f"{sum(e['state'] == 'unreachable' for e in res)} unreachable; `skills-gate diff <name>`, "
@@ -2868,11 +3089,129 @@ def cmd_diff(a):
         say(f"{a.skill}: bank copy matches upstream")
 
 
+RISK_ORDER = {"": 0, "low": 1, "medium": 2, "high": 3}
+
+
+def skipped_versions(c, name: str) -> set:
+    return {r[0] for r in c.execute("select hash from update_skip where skill=?", (name,))}
+
+
+def skip_version(c, name: str, h: str, why: str):
+    """Never offer this upstream version of the skill again (synced to peers)."""
+    c.execute("insert or ignore into update_skip values (?,?,?)", (name, h, now()))
+    event(c, name, "update-skip", why)
+
+
+def judge_update(c, cfg, e: dict, td: Path) -> dict:
+    """Vet one upstream change the way the nightly pass does: the full install vetting on the new version, with the
+    diff handed to the reviewer, plus what the change itself does (new hosts, higher risk). Returns the vet report
+    with `hold`, the reasons an unattended update must wait for the user."""
+    name, bank = e["name"], bank_path(e["name"])
+    lines = tree_diff(bank, e["dir"], "installed", "upstream")
+    diff = Path(td) / f"{name}.diff"
+    diff.write_text("".join(lines), encoding="utf-8")
+    rep = vet(c, cfg, e["dir"], name, quiet=True, diff=diff)
+    old_eg = egress(bank) if (bank / "SKILL.md").is_file() else {"hosts": {}}
+    approved = net_approved(c, cfg, name)
+    new_hosts = sorted(h for h in rep["egress"]["hosts"] if h not in old_eg["hosts"] and not host_ok(h, approved))
+    old_risk = (e["row"]["risk"] or "") if e.get("row") is not None else ""
+    hold = list(rep["blocks"])
+    if e["edited"]:
+        hold.append("the bank copy has local edits; an update would overwrite them")
+    if new_hosts:
+        hold.append(f"the change adds calls to {', '.join(new_hosts[:4])}")
+    if RISK_ORDER.get(rep["level"], 0) > RISK_ORDER.get(old_risk, 0):
+        hold.append(f"scan risk rises from {old_risk or 'clean'} to {rep['level']}")
+    v = rep["review"]["verdict"]
+    if v == "none":
+        hold.append("no local reviewer configured (trust.review_cmd); unattended updates need its pass")
+    elif v != "pass" and not any(x.startswith("reviewer:") for x in hold):
+        hold.append(f"reviewer {v}: {short(rep['review'].get('notes', ''), 160)}")
+    rep.update(hold=hold, diff="".join(lines)[:200_000], files=sum(1 for ln in lines if ln.startswith("+++")))
+    return rep
+
+
+def apply_update(c, e: dict, rep: dict, kind: str = "update"):
+    row = get(c, e["name"])
+    keep_copy(e["name"], "pre-update", row)
+    register(c, e["dir"], force=True, source=e["source"], ref=e["ref"], kind=kind, name=e["name"], up_tree=e["up_tree"])
+    record_review(c, e["name"], rep)
+
+
+def already_held(name: str, h: str) -> bool:
+    qroot = HOME / "quarantine"
+    return any(q.is_dir() and re.fullmatch(re.escape(name) + r"-\d{8}-\d{6}(-\d+)?", q.name) and held_hash(q) == h
+               for q in (qroot.glob(f"{name}-*") if qroot.is_dir() else ()))
+
+
+def hold_update(c, e: dict, rep: dict) -> Path | None:
+    """Park an upstream change in quarantine with its report and diff, once per upstream version."""
+    if already_held(e["name"], held_hash(e["dir"])):
+        return None  # already waiting for you
+    rep = dict(rep, blocks=rep["hold"])
+    meta = {"source": e["source"], "ref": e["ref"], "lane": e["row"]["lane"], "up_tree": e["up_tree"], "update": True}
+    q = quarantine(e["dir"], e["name"], rep, meta)
+    event(c, e["name"], "update-held", "; ".join(rep["hold"])[:200])
+    return q
+
+
+def update_pass(c, cfg, quiet: bool = False) -> dict:
+    """The nightly update: check every skill with a known upstream; apply what passes `judge_update` cleanly, hold
+    the rest in quarantine (update.nightly = auto), hold everything (hold), or only report (check)."""
+    mode = (cfg.get("update") or {}).get("nightly", "auto")
+    out = {"checked": 0, "available": 0, "applied": [], "held": [], "gone": [], "deferred": 0}
+    if mode == "off":
+        return out
+    out["recovered"] = recover_sources(c, cfg)
+    rows = [r for r in c.execute("select * from skills order by name").fetchall()
+            if not r["link"] and parse_source(r["source"])]
+    cap = int((cfg.get("update") or {}).get("max_reviews", 10))
+    with tempfile.TemporaryDirectory(prefix="skills-gate-up-") as td:
+        res = check_updates(c, [], Path(td), rows=rows)
+        out["checked"] = len(res)
+        for e in res:
+            if e["state"] == "gone upstream":
+                out["gone"].append(e["name"])
+            if e["state"] != "update":
+                continue
+            h = held_hash(e["dir"])
+            if h in skipped_versions(c, e["name"]):
+                continue
+            out["available"] += 1
+            if mode != "check" and already_held(e["name"], h):
+                out["waiting"] = out.get("waiting", 0) + 1
+                continue  # held on an earlier night; no second review
+            if mode == "check":
+                say(f"[update] {e['name']}: upstream changed; `skills-gate diff {e['name']}`")
+                continue
+            if cap <= 0:
+                out["deferred"] += 1
+                continue
+            cap -= 1
+            rep = judge_update(c, cfg, e, Path(td))
+            if mode == "auto" and not rep["hold"]:
+                apply_update(c, e, rep, kind="auto-update")
+                out["applied"].append(e["name"])
+                say(f"[update] {e['name']}: {rep['files']} file(s) changed upstream; reviewer passed it; applied"
+                    f" (undo: skills-gate rollback {e['name']})")
+            else:
+                reasons = rep["hold"] or ["update.nightly is hold"]
+                rep["hold"] = reasons
+                q = hold_update(c, e, rep)
+                if q:
+                    out["held"].append(e["name"])
+                    say(f"[update] {e['name']}: held, {reasons[0]}; `skills-gate quarantine show {q.name}`")
+            c.commit()
+    return out
+
+
 def cmd_update(a):
     c = db()
     cfg = config()
     if not a.skills and not a.all:
         die("name skills to update, or --all")
+    if recover_sources(c, cfg):
+        c.commit()
     with tempfile.TemporaryDirectory(prefix="skills-gate-") as td:
         res = [e for e in check_updates(c, a.skills, Path(td)) if e["state"] == "update"]
         plan = []
@@ -2881,13 +3220,17 @@ def cmd_update(a):
                 say(f"[skip]  {e['name']}: edited here (see `skills-gate diff {e['name']}`); --force overwrites,"
                     f" keeping the old copy in cold/")
                 continue
-            changes = sum(1 for ln in tree_diff(bank_path(e["name"]), e["dir"], "a", "b") if ln.startswith("+++"))
-            say(f"[new]   {e['name']}: {changes} file(s) change")
-            e["rep"] = vet(c, cfg, e["dir"], e["name"], allow_risky=a.allow_risky, allow_net=a.allow_net)
+            lines = tree_diff(bank_path(e["name"]), e["dir"], "installed", "upstream")
+            diff = Path(td) / f"{e['name']}.diff"
+            diff.write_text("".join(lines), encoding="utf-8")
+            say(f"[new]   {e['name']}: {sum(1 for ln in lines if ln.startswith('+++'))} file(s) change"
+                + ("  (moved upstream)" if e["moved"] else ""))
+            e["rep"] = vet(c, cfg, e["dir"], e["name"], allow_risky=a.allow_risky, allow_net=a.allow_net, diff=diff)
             if not e["rep"]["ok"]:
                 continue
             plan.append(e)
         if not plan:
+            c.commit()
             say("nothing to update")
             return
         if any("://" in e["source"] or e["source"].startswith("git@") for e in plan) and \
@@ -2895,13 +3238,36 @@ def cmd_update(a):
             say("nothing updated")
             return
         for e in plan:
-            keep_copy(e["name"], "pre-update")
-            register(c, e["dir"], force=True, source=e["source"], ref=e["ref"], kind="update",
-                     name=e["name"])
-            record_review(c, e["name"], e["rep"])
+            apply_update(c, e, e["rep"])
     write_registry(c, cfg)
     c.commit()
-    say(f"updated {len(plan)} skill(s); old copies in {COLD}")
+    say(f"updated {len(plan)} skill(s); old copies in {COLD} (undo one: skills-gate rollback <name>)")
+
+
+def cmd_rollback(a):
+    """Put back the copy a skill had before its last update, and never offer the version rolled back from again."""
+    c = db()
+    cfg = config()
+    r = get(c, a.skill)
+    copies = sorted(d for d in COLD.glob(f"{r['name']}.pre-update-*") if d.is_dir()) if COLD.is_dir() else []
+    if not copies:
+        die(f"{r['name']}: no earlier copy in {COLD}; nothing to roll back to")
+    old = copies[-1]
+    origin = Path(f"{old}.origin.json")
+    meta = json.loads(origin.read_text()) if origin.is_file() else {}
+    bad, when = held_hash(bank_path(r["name"])), old.name.split(".pre-update-", 1)[1]
+    keep_copy(r["name"], "pre-rollback", r)
+    register(c, old, force=True, source=meta.get("source", r["source"]), ref=meta.get("ref", r["ref"]),
+             name=r["name"], kind="rollback", up_tree=meta.get("up_tree", ""))
+    if meta.get("orig_hash"):
+        c.execute("update skills set orig_hash=? where name=?", (meta["orig_hash"], r["name"]))
+    skip_version(c, r["name"], bad, "rolled back")
+    rm(old)
+    origin.unlink(missing_ok=True)
+    write_registry(c, cfg)
+    c.commit()
+    say(f"[rollback] {r['name']}: back to the copy kept on {when}; the version rolled back from will not be offered"
+        f" again (`skills-gate rollback` once more to step further back)")
 
 
 # ---------------------------------------------------------------------------------------------------- distill
@@ -3343,7 +3709,7 @@ def sync_fetch(c) -> dict:
 
 # Settings every peer shares. Paths (harness_dirs, usage_sources, ref_roots, project_dirs) stay per machine.
 SHARED_CONFIG = ("always_on", "prune_days", "cold_days", "marketplace", "market_ttl_hours", "market", "trust",
-                 "suggest", "ignore_agents", "distill")
+                 "suggest", "ignore_agents", "distill", "update")
 
 
 def peer_name(cfg: dict | None = None) -> str:
@@ -3365,6 +3731,11 @@ def shared_get(c, ns: str) -> dict:
                 c.execute("select name, group_concat(skill, '\n') from presets group by name")}
     if ns == "attrs":
         return {r[0]: {"lane": r[1], "pinned": r[2]} for r in c.execute("select name, lane, pinned from skills")}
+    if ns == "skips":  # upstream versions someone rolled back or dropped, so no peer applies them again
+        out = {}
+        for r in c.execute("select skill, hash from update_skip order by skill, hash"):
+            out.setdefault(r[0], []).append(r[1])
+        return out
     if ns == "distill":  # decisions on mined workflows, so no peer proposes what you already turned down
         return {r[0]: [r[1], r[2]] for r in
                 c.execute("select fp, name, status from distill where status in ('accepted', 'rejected')")}
@@ -3397,11 +3768,13 @@ def shared_set(c, ns: str, key: str, value):
             rm(DRAFTS / row["name"])  # decided on a peer; this machine's draft of it is moot
         c.execute("insert into distill values (?,?,?,?,'[]') on conflict(fp) do update set status=excluded.status",
                   (key, value[0], value[1], now()))
+    elif ns == "skips":
+        c.executemany("insert or ignore into update_skip values (?,?,?)", [(key, h, now()) for h in value or []])
     elif ns == "attrs" and value is not None:
         c.execute("update skills set lane=?, pinned=? where name=?", (value["lane"], value["pinned"], key))
 
 
-def sync_shared(c, reg: dict, spaces=("config", "net_allow", "presets", "attrs", "distill")) -> dict:
+def sync_shared(c, reg: dict, spaces=("config", "net_allow", "presets", "attrs", "distill", "skips")) -> dict:
     """Three-way merge of the shared settings, approvals, presets and per-skill lane/pin, key by key: the side
     that changed since the last sync wins; when both changed, this machine keeps its own and says so. Before a
     first sync (no base) two lists merge as a union, and a value still at its default takes the peer's."""
@@ -3509,7 +3882,7 @@ def sync_merge(c, reg: dict, policy: str) -> dict:
         if not NAME_RX.match(name):
             continue
         rdir, hr, hb, row = SYNC / "skills" / name, info["hash"], base.get(name), local.get(name)
-        meta = {"lane": info.get("lane"), "pinned": info.get("pinned", 0)}
+        meta = {"lane": info.get("lane"), "pinned": info.get("pinned", 0), "up_tree": info.get("up_tree", "")}
         have_copy = (rdir / "SKILL.md").is_file()
         if row is None:
             if hb is not None and hb == hr:
@@ -3581,7 +3954,7 @@ def sync_merge(c, reg: dict, policy: str) -> dict:
             stats["removed"] += 1
         else:
             say(f"[keep]  {name}: removed on another machine, but edited here; kept (remove it to agree)")
-    sync_shared(c, reg, ("presets", "attrs", "distill"))  # after the skills, so presets and lanes find their members
+    sync_shared(c, reg, ("presets", "attrs", "distill", "skips"))  # after the skills, so presets and lanes find their members
     return stats
 
 
@@ -3621,10 +3994,10 @@ def sync_export(c, remote: dict):
         # a peer holding a copy keeps the linking peer's path, or the two would rewrite it on every push
         ls = str(p.resolve()) if r["link"] else remote.get("skills", {}).get(name, {}).get("link_source", "")
         reg["skills"][name] = {"lane": r["lane"], "description": r["description"], "source": r["source"],
-                               "link_source": ls, "pinned": r["pinned"], "hash": h}
+                               "link_source": ls, "pinned": r["pinned"], "hash": h, "up_tree": r["up_tree"]}
         c.execute("insert or replace into sync_state values (?,?)", (name, h))
     reg["version"] = 3
-    for ns in ("config", "net_allow", "presets", "attrs", "distill"):
+    for ns in ("config", "net_allow", "presets", "attrs", "distill", "skips"):
         reg[ns] = shared_get(c, ns)
         meta_set(c, f"sync:{ns}", json.dumps(reg[ns], sort_keys=True))  # both sides now agree on this
     cfg = config()
@@ -3729,15 +4102,21 @@ def cmd_agents(a):
     if a.action in (None, "list"):
         say(f"{'agent':<10} {'state':<10} {'skills':>6}  folder")
         ignored = set(cfg.get("ignore_agents", []))
+        absent = []
         for name, info in KNOWN_AGENTS.items():
             if name in ignored:
                 continue
             path = Path(cfg["harness_dirs"].get(name) or info["global"]).expanduser()
             gated = bool(cfg["harness_dirs"].get(name)) and path.is_dir()
             state = "gated" if gated else "detected" if Path(info["home"]).expanduser().is_dir() else "-"
+            if state == "-" and not getattr(a, "all", False):
+                absent.append(name)
+                continue
             count = sum(1 for e in path.iterdir() if (e / "SKILL.md").is_file()) if path.is_dir() else 0
             note = f"  ({info['note']})" if info.get("note") else ""
             say(f"{name:<10} {state:<10} {count:>6}  {path}{note}")
+        if absent:
+            say(f"not on this machine ({len(absent)}, --all lists them): {', '.join(absent)}")
         for name, p in cfg["harness_dirs"].items():
             if name not in KNOWN_AGENTS and p:
                 say(f"{name:<10} {'gated':<10} {'':>6}  {Path(p).expanduser()}  (custom)")
@@ -3872,7 +4251,8 @@ def main(argv=None):
     sp = ap.add_subparsers(dest="cmd", required=True)
 
     sp.add_parser("init", help="create ~/.skills-gate and put the gate skill in every harness").set_defaults(f=cmd_init)
-    p = sp.add_parser("add", help="install skills from a folder, git URL or owner/repo[/path][:skill][@ref]")
+    p = sp.add_parser("add", help="install skills from a folder, a .zip or .skill archive, a git URL or"
+                                  " owner/repo[/path][:skill][@ref]")
     p.add_argument("source")
     p.add_argument("--lane")
     p.add_argument("--only", nargs="*", help="only these skill names from a multi-skill source")
@@ -3946,8 +4326,9 @@ def main(argv=None):
     p.add_argument("--static", action="store_true", help="scan and egress only, skip the reviewer")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(f=cmd_review)
-    p = sp.add_parser("quarantine", help="skills held back by vetting: list | release ENTRY [--allow-net] | rm ENTRY")
-    p.add_argument("action", nargs="?", choices=["list", "release", "rm"])
+    p = sp.add_parser("quarantine", help="skills and updates held back by vetting: list | show ENTRY |"
+                                         " release ENTRY [--allow-net] | rm ENTRY")
+    p.add_argument("action", nargs="?", choices=["list", "show", "release", "rm"])
     p.add_argument("entries", nargs="*")
     p.add_argument("--all", action="store_true")
     p.add_argument("--allow-net", action="store_true")
@@ -3994,6 +4375,7 @@ def main(argv=None):
     p = sp.add_parser("tidy", help="daily pass: usage, references, stale toggles off, cold storage, registry, leaks")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--fix", action="store_true", help="re-gate skills that bypassed the gate")
+    p.add_argument("--no-updates", dest="updates", action="store_false", help="skip the upstream update pass")
     p.set_defaults(f=cmd_tidy)
     p = sp.add_parser("harvest", help="count skill loads in every harness's session logs now")
     p.add_argument("--reset", action="store_true", help="forget harvested counts and count every log again")
@@ -4023,6 +4405,9 @@ def main(argv=None):
     p.add_argument("--allow-risky", action="store_true")
     p.add_argument("--allow-net", action="store_true", help="approve the external hosts the new version calls")
     p.set_defaults(f=cmd_update)
+    p = sp.add_parser("rollback", help="put back a skill's copy from before its last update; skip that version")
+    p.add_argument("skill")
+    p.set_defaults(f=cmd_rollback)
     p = sp.add_parser("remote", help="show or set the git remote the bank syncs through")
     p.add_argument("url", nargs="?")
     p.set_defaults(f=cmd_remote)
@@ -4053,6 +4438,7 @@ def main(argv=None):
     p.add_argument("name", nargs="?")
     p.add_argument("--dir")
     p.add_argument("--no-project", action="store_true", help="do not add its project folder to project_dirs")
+    p.add_argument("--all", action="store_true", help="list known harnesses that are not on this machine too")
     p.set_defaults(f=cmd_agents)
     p = sp.add_parser("stats", help="usage by harness, top skills, cold candidates, suggestion hit rate")
     p.add_argument("--days", type=int, default=30)
