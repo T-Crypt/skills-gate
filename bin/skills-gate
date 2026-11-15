@@ -3411,12 +3411,13 @@ def sync_shared(c, reg: dict, spaces=("config", "net_allow", "presets", "attrs",
         if remote is None:  # a peer on an older version, or a fresh remote: nothing to take
             continue
         base = json.loads(meta_get(c, f"sync:{ns}") or "null")
-        first = base is None
+        base_none = base is None
         base, newbase, clash = base or {}, dict(base or {}), []
         for k in sorted(set(local) | set(remote)):
             if ns == "attrs" and k not in local:
                 continue  # a skill not here (yet): its lane and pin arrive with it
             l, r, b = local.get(k), remote.get(k), base.get(k)
+            first = base_none or k not in base  # never synced, or a key that became shared since
             if l == r:
                 v = l
             elif l == b:

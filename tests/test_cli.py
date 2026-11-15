@@ -533,6 +533,17 @@ class ReviewRegressionTest(Base):
         self.sg("push")
         self.sg("pull", env=env2)
         self.assertEqual(self.cfg2(home2)["cold_days"], 60)
+        # a key that becomes shared after the first sync (an upgrade): the peer still at the default takes it
+        db2 = sqlite3.connect(home2 / ".skills-gate" / "gate.db")
+        base = json.loads(db2.execute("select value from meta where key='sync:config'").fetchone()[0])
+        base.pop("suggest", None)
+        db2.execute("update meta set value=? where key='sync:config'", (json.dumps(base),))
+        db2.commit()
+        db2.close()
+        self.set_config(suggest={"limit": 2})
+        self.sg("push")
+        self.sg("pull", env=env2)
+        self.assertEqual(self.cfg2(home2)["suggest"]["limit"], 2)
         # presets: a deletion travels too
         self.sg("preset", "save", "kit", "code-review")
         self.sg("push")
