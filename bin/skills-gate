@@ -36,7 +36,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 HOME = Path(os.environ.get("SKILLS_GATE_HOME", Path.home() / ".skills-gate")).expanduser()
 BANK, COLD, GATED = HOME / "bank", HOME / "cold", HOME / "gated"
 DB, CONFIG, LANES_DIR = HOME / "gate.db", HOME / "config.json", HOME / "lanes"
@@ -82,6 +82,12 @@ DEFAULT_CONFIG = {
     },
     # Folders (prompts, role files, configs) whose mentions of a bank skill keep it out of cold storage.
     "ref_roots": [],
+    # Local first. egress: deny (a skill that calls an external host needs the user's approval for that host),
+    # warn, or allow. allow_hosts: hosts every skill may reach. review_cmd: optional reviewer run on every new skill
+    # (gets the folder and name; last stdout line is JSON {"verdict": pass|warn|fail|skipped, "notes": ...}).
+    # review_pending: allow or block an install when the reviewer could not run.
+    "trust": {"egress": "deny", "allow_hosts": [], "review_cmd": "", "review_timeout": 600, "review_pending": "allow",
+              "nightly_review": 20},
     # Prompt-time suggestions: at most `limit`, only above `min_score`, and within `ratio` of the best match.
     "suggest": {"limit": 3, "min_score": 7.0, "ratio": 0.55, "min_prompt": 12},
 }
@@ -220,6 +226,11 @@ def db(timeout: float = 15) -> sqlite3.Connection:
     create table if not exists presets (name text not null, skill text not null, primary key (name, skill));
     create table if not exists market_cache (key text primary key, at integer not null, body text not null);
     create table if not exists sync_state (name text primary key, hash text not null);
+    create table if not exists net_allow (skill text not null, host text not null, at integer not null,
+        by text not null default 'user', primary key (skill, host));
+    create table if not exists reviews (name text primary key, hash text not null, at integer not null,
+        level text not null default '', egress text not null default '{}', verdict text not null default '',
+        notes text not null default '');
     create index if not exists events_skill on events (skill, at);
     """)
     have = {r[1] for r in c.execute("pragma table_info(skills)")}
@@ -520,7 +531,7 @@ def project_root(start: Path | None = None) -> Path:
     start = (start or Path.cwd()).resolve()
     try:
         out = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel"], capture_output=True,
-                             text=True, timeout=10)
+                             text=True, timeout=10, env=git_env())
         if out.returncode == 0 and out.stdout.strip():
             return Path(out.stdout.strip())
     except (OSError, subprocess.TimeoutExpired):
@@ -673,6 +684,11 @@ skills-gate add <source> --yes   # install into the bank; scans it first. Pass -
 Rules: prefer `use` for a one-off task and `on` for a project that will keep needing it. Never install from the
 market without the user's yes, and show them what the install scan reported. Do not copy bank skills into
 global folders by hand: the daily `tidy` removes anything that bypasses the gate.
+
+Local first: a skill never calls out. Do not run a skill's command or script that reaches an external host
+unless the user approved that host (`skills-gate net` lists approvals; `use` prints a NETWORK NOT APPROVED
+notice when a skill has none). Local and tailnet addresses are fine. Never pass --allow-net or --allow-risky
+yourself; only the user decides those.
 
 ## Lanes
 """
@@ -854,9 +870,18 @@ def parse_source(s: str):
     return url, ("" if rel == "." else rel), commit
 
 
+def git_env() -> dict:
+    """Clean env for the tool's own git calls. Harnesses inject GIT_CONFIG_COUNT/KEY_n/VALUE_n (agent guards that
+    force feature branches); they must not change what skills-gate does with the user's own bank sync repo."""
+    env = dict(os.environ)
+    for k in [k for k in env if re.fullmatch(r"GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)", k)]:
+        del env[k]
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
 def git_run(args: list[str], cwd=None, timeout=300) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=timeout,
-                          env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=timeout, env=git_env())
 
 
 def fetch_repo(url: str, ref: str, td: Path, commit: str = "") -> tuple[Path, str]:
@@ -875,30 +900,335 @@ def fetch_repo(url: str, ref: str, td: Path, commit: str = "") -> tuple[Path, st
 
 
 def install_dirs(c, dirs: list[Path], *, remote: bool, yes: bool, allow_risky: bool, lane=None, link=False,
-                 force=False, source_of=lambda d: "", ref="", only=None) -> list[str]:
-    """Scan, ask, register. Remote installs need the user's yes; a high-risk finding needs --allow-risky too."""
+                 force=False, source_of=lambda d: "", ref="", only=None, allow_net=False) -> list[str]:
+    """Quarantine, vet, ask, register. A skill linked from your own folder is vetted in place; everything else is
+    copied to quarantine first and enters the bank only when nothing blocks it. Remote installs need the user's yes."""
+    cfg = config()
     chosen = [d for d in dirs if not only or d.name in only or frontmatter(d / "SKILL.md").get("name") in only]
     if not chosen:
         die("no matching skill in the source" + (f" (wanted: {', '.join(only)})" if only else ""))
-    reports = {d: scan_tree(d) for d in chosen}
+    staged = []
     for d in chosen:
-        print_scan(frontmatter(d / "SKILL.md").get("name") or d.name, d, reports[d])
-    risky = [d for d in chosen if scan_level(reports[d]) == "high"]
-    if risky and not allow_risky:
-        say(f"[block] {len(risky)} skill(s) with high-risk findings are not installed; read them, then pass "
-            f"--allow-risky if they are fine: " + ", ".join(d.name for d in risky))
-        chosen = [d for d in chosen if d not in risky]
-    if not chosen:
+        name = frontmatter(d / "SKILL.md").get("name") or d.name
+        meta = {"source": source_of(d), "ref": ref, "lane": lane}
+        here = d if link else quarantine(d, name)
+        rep = vet(c, cfg, here, name, allow_risky=allow_risky, allow_net=allow_net)
+        if rep["ok"] or link:  # a link to your own folder is reported, never blocked; `use` still enforces egress
+            staged.append((d, here, name, rep, meta))
+        elif not link:
+            (here / ".skills-gate-report.json").write_text(json.dumps(dict(rep, meta=meta), indent=1, default=str))
+            event(c, name, "held", "; ".join(rep["blocks"])[:200])
+            say(f"[held]  {name} stays in quarantine: {here}")
+    c.commit()
+    if not staged:
         return []
-    if remote and not confirm(f"Install {len(chosen)} skill(s) into the bank?", yes):
+    if remote and not confirm(f"Install {len(staged)} vetted skill(s) into the bank?", yes):
+        for _, here, *_ in staged:
+            rm(here)
         say("nothing installed")
         return []
     added = []
-    for d in chosen:
-        n = register(c, d, lane, link=link, force=force, source=source_of(d), ref=ref)
+    for d, here, name, rep, meta in staged:
+        n = register(c, d if link else here, lane, link=link, force=force, source=meta["source"], ref=ref,
+                     name=name)
         if n:
+            record_review(c, n, rep)
             added.append(n)
+        if not link:
+            rm(here)
     return added
+
+
+# ---------------------------------------------------------------------------------------------------- trust
+# Local first: a skill may not reach an external host unless the user approved that host for that skill. Every new
+# skill is vetted in quarantine (install scan, egress, an optional reviewer) before it can enter the bank.
+
+URL_RX = re.compile(r"\b(?:https?|wss?)://([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::\d+)?")
+LOCAL_HOST_RX = re.compile(
+    r"^(localhost|0\.0\.0\.0|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|"
+    r"172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+)$|"
+    r"(\.local|\.lan|\.internal|\.home\.arpa|\.ts\.net|\.localhost|\.test|\.invalid|\.example)$|"
+    r"^(example\.(com|org|net)|[\w-]+\.example\.(com|org|net))$", re.I)
+NET_API_RX = re.compile(
+    r"\b(curl|wget|Invoke-WebRequest|Invoke-RestMethod|requests\.(get|post|put|patch|delete|request|Session)\b|"
+    r"httpx\.|urllib\.request|urlopen\(|http\.client|aiohttp|axios|node-fetch|got\(|https?\.(get|request)\(|"
+    r"new WebSocket|socket\.connect|net\.connect|XMLHttpRequest)|(?<![\w.])fetch\(")
+DOC_CALL_RX = re.compile(r"\b(curl|wget|Invoke-WebRequest|Invoke-RestMethod|WebFetch|webfetch)\b|\bfetch\(")
+TELEMETRY_RX = re.compile(
+    r"posthog|mixpanel|api\.segment\.io|cdn\.segment\.com|amplitude\.com|@amplitude/|@sentry/|sentry_sdk|"
+    r"ingest\.sentry\.io|datadoghq|google-analytics\.com|googletagmanager|plausible\.io|umami\.is|"
+    r"honeycomb\.io|newrelic|bugsnag|rollbar|logrocket|hotjar|statsig", re.I)
+# XML/office namespace identifiers: URIs that name a schema inside a document, never call targets.
+NAMESPACE_HOSTS = {"schemas.openxmlformats.org", "schemas.microsoft.com", "openoffice.org", "www.w3.org", "w3.org",
+                   "purl.org", "ns.adobe.com", "docbook.org"}
+
+
+def is_local_host(host: str) -> bool:
+    return bool(LOCAL_HOST_RX.search(host.lower().strip(".")))
+
+
+def egress(path: Path) -> dict:
+    """Where a skill would call out: external hosts in scripts (and in commands its playbook tells the agent to
+    run), network code with no literal host ('?'), and telemetry SDKs. Local and tailnet addresses do not count."""
+    hosts: dict[str, list[str]] = {}
+    unknown, telemetry = [], []
+    for f, rel in files_of(path):
+        ext = f.suffix.lower()
+        try:
+            data = f.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in data[:4096] or len(data) > 2_000_000:
+            continue
+        text = data.decode("utf-8", errors="replace")
+        script = ext in SCRIPT_EXT or text.startswith("#!")
+        doc = not script and ext in DOC_EXT
+        for i, line in enumerate(text.splitlines(), 1):
+            where = f"{rel}:{i}"
+            if script and line.lstrip().startswith(("#", "//", "*", "/*")) and not URL_RX.search(line):
+                continue
+            ext_hosts = [h for h in URL_RX.findall(line) if not is_local_host(h) and h.lower() not in NAMESPACE_HOSTS]
+            if script or (doc and DOC_CALL_RX.search(line)):
+                for h in ext_hosts:
+                    hosts.setdefault(h.lower(), []).append(where)
+                if script and not ext_hosts and not URL_RX.search(line) and NET_API_RX.search(line):
+                    unknown.append(where)
+            if script and TELEMETRY_RX.search(line):
+                telemetry.append(where)
+    return {"hosts": {h: w[:3] for h, w in sorted(hosts.items())}, "unknown": unknown[:5],
+            "telemetry": telemetry[:5]}
+
+
+def net_approved(c, cfg, name: str) -> set[str]:
+    rows = {r[0] for r in c.execute("select host from net_allow where skill=?", (name,))}
+    return rows | {"*" + h if h.startswith(".") else h for h in cfg["trust"].get("allow_hosts", [])}
+
+
+def host_ok(host: str, approved: set[str]) -> bool:
+    if "*" in approved or host in approved:
+        return True
+    return any(a.startswith("*.") and (host == a[2:] or host.endswith(a[1:])) for a in approved)
+
+
+def unapproved(c, cfg, name: str, eg: dict) -> list[str]:
+    ok = net_approved(c, cfg, name)
+    need = [h for h in eg["hosts"] if not host_ok(h, ok)]
+    if (eg["unknown"] or eg["telemetry"] and not eg["hosts"]) and not host_ok("?", ok):
+        need.append("?")
+    return need
+
+
+def approve_net(c, name: str, hosts: list[str], why: str = "user"):
+    c.executemany("insert or replace into net_allow values (?,?,?,?)", [(name, h, now(), why) for h in hosts])
+    event(c, name, "net-allow", ",".join(hosts))
+
+
+def run_reviewer(cfg, path: Path, name: str) -> dict:
+    """The optional reviewer: trust.review_cmd gets the skill folder; its last stdout line is JSON with a verdict
+    (pass | warn | fail | skipped) and notes. It must read the skill, never run it."""
+    cmd = cfg["trust"].get("review_cmd")
+    if not cmd:
+        return {"verdict": "none", "notes": "no reviewer configured"}
+    try:
+        argv = [os.path.expanduser(x) for x in (cmd if isinstance(cmd, list) else cmd.split())] + [str(path), name]
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=int(cfg["trust"].get("review_timeout", 600)))
+        line = next((ln for ln in reversed(r.stdout.strip().splitlines()) if ln.strip().startswith("{")), "")
+        out = json.loads(line) if line else {"verdict": "error", "notes": short(r.stderr or r.stdout, 200)}
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        out = {"verdict": "error", "notes": short(str(e), 200)}
+    if out.get("verdict") not in ("pass", "warn", "fail", "skipped", "error"):
+        out = {"verdict": "error", "notes": f"unreadable verdict: {short(json.dumps(out), 150)}"}
+    return out
+
+
+def vet(c, cfg, path: Path, name: str, *, allow_risky=False, allow_net=False, review=True, quiet=False) -> dict:
+    """The gate every new or changed skill passes: install scan, egress against approvals, the reviewer.
+    Returns a report with ok=True only when nothing blocks it."""
+    findings = scan_tree(path)
+    level = scan_level(findings)
+    eg = egress(path)
+    if allow_net and (eg["hosts"] or eg["unknown"] or eg["telemetry"]):
+        approve_net(c, name, list(eg["hosts"]) + (["?"] if eg["unknown"] or eg["telemetry"] else []), "--allow-net")
+    need = unapproved(c, cfg, name, eg)
+    rev = run_reviewer(cfg, path, name) if review else {"verdict": "none", "notes": ""}
+    blocks = []
+    if level == "high" and not allow_risky:
+        blocks.append("high-risk scan findings (--allow-risky after reading them)")
+    policy = cfg["trust"].get("egress", "deny")
+    if need and policy == "deny":
+        blocks.append(f"calls out to unapproved hosts: {', '.join(need)} (--allow-net, or `skills-gate net allow`)")
+    if eg["telemetry"] and policy != "allow" and not host_ok("?", net_approved(c, cfg, name)) and not allow_net:
+        blocks.append(f"telemetry code at {', '.join(eg['telemetry'][:2])}")
+    if rev["verdict"] == "fail" and not allow_risky:
+        blocks.append(f"reviewer: {rev['notes']}")
+    if rev["verdict"] in ("skipped", "error") and cfg["trust"].get("review_pending") == "block":
+        blocks.append(f"review could not run ({rev['notes']}) and trust.review_pending is block")
+    rep = {"name": name, "ok": not blocks, "blocks": blocks, "level": level, "findings": findings, "egress": eg,
+           "unapproved": need, "review": rev}
+    if not quiet:
+        print_scan(name, path, findings, limit=8)
+        if eg["hosts"] or eg["unknown"] or eg["telemetry"]:
+            say(f"[net]   {name}: calls out to {', '.join(eg['hosts']) or 'no literal host'}"
+                + (f"; network code without a host at {', '.join(eg['unknown'][:2])}" if eg["unknown"] else "")
+                + (f"; TELEMETRY at {', '.join(eg['telemetry'][:2])}" if eg["telemetry"] else "")
+                + (f"  (unapproved: {', '.join(need)})" if need else "  (approved)"))
+        if rev["verdict"] != "none":
+            say(f"[review] {name}: {rev['verdict']}" + (f" - {short(rev.get('notes', ''), 160)}" if rev.get("notes") else ""))
+        for b in blocks:
+            say(f"[block] {name}: {b}")
+    return rep
+
+
+def record_review(c, name: str, rep: dict):
+    p = bank_path(name)
+    c.execute("insert or replace into reviews values (?,?,?,?,?,?,?)",
+              (name, tree_hash(p) if p.exists() else "", now(), rep["level"],
+               json.dumps({"hosts": list(rep["egress"]["hosts"]), "unknown": bool(rep["egress"]["unknown"]),
+                           "telemetry": bool(rep["egress"]["telemetry"]), "unapproved": rep["unapproved"]}),
+               rep["review"]["verdict"], short(rep["review"].get("notes", ""), 500)))
+
+
+def quarantine(src: Path, name: str, rep: dict | None = None, meta: dict | None = None) -> Path:
+    q = HOME / "quarantine" / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    i = 1
+    while q.exists():
+        q, i = Path(f"{q}-{i}"), i + 1
+    shutil.copytree(src, q, ignore=IGNORE, symlinks=False)
+    if rep is not None:
+        (q / ".skills-gate-report.json").write_text(json.dumps(dict(rep, meta=meta or {}), indent=1, default=str))
+    return q
+
+
+def cmd_net(a):
+    c = db()
+    cfg = config()
+    if a.action in (None, "list"):
+        rows = c.execute("select name from skills order by name").fetchall()
+        shown = 0
+        for r in rows:
+            p = bank_path(r["name"])
+            if not (p / "SKILL.md").is_file():
+                continue
+            eg = egress(p)
+            if not (eg["hosts"] or eg["unknown"] or eg["telemetry"]):
+                continue
+            need = unapproved(c, cfg, r["name"], eg)
+            if need or a.all:
+                shown += 1
+                tag = "UNAPPROVED" if need else "approved"
+                hosts = ", ".join(list(eg["hosts"])[:5]) + (" ..." if len(eg["hosts"]) > 5 else "")
+                extra = (" +code without host" if eg["unknown"] else "") + (" +TELEMETRY" if eg["telemetry"] else "")
+                say(f"{r['name']:<30} {tag:<10} {hosts or '-'}{extra}")
+        say(f"{shown} skill(s){' with unapproved egress' if not a.all else ' that call out'}; policy:"
+            f" {cfg['trust'].get('egress', 'deny')}.  approve: skills-gate net allow <skill> [hosts]")
+        return
+    if a.action == "hosts":
+        for r in c.execute("select skill, host, at, by from net_allow order by skill, host"):
+            say(f"{r['skill']:<30} {r['host']:<40} {day(r['at'])} ({r['by']})")
+        return
+    if not a.skill:
+        die(f"net {a.action} needs a skill")
+    r = get(c, a.skill)
+    if a.action == "allow":
+        hosts = a.hosts
+        if not hosts:
+            eg = egress(bank_path(r["name"]))
+            hosts = list(eg["hosts"]) + (["?"] if eg["unknown"] or eg["telemetry"] else [])
+            if not hosts:
+                die(f"{r['name']} does not call out; nothing to approve")
+        approve_net(c, r["name"], hosts)
+        say(f"[allow] {r['name']} may reach: {', '.join(hosts)}")
+    elif a.action == "revoke":
+        if a.hosts:
+            c.executemany("delete from net_allow where skill=? and host=?", [(r["name"], h) for h in a.hosts])
+        else:
+            c.execute("delete from net_allow where skill=?", (r["name"],))
+        event(c, r["name"], "net-revoke", ",".join(a.hosts))
+        say(f"[revoke] {r['name']}: {', '.join(a.hosts) or 'every host'}")
+    c.commit()
+
+
+def cmd_review(a):
+    """Vet bank skills again (scan, egress, reviewer) and record the result; nothing is removed."""
+    c = db()
+    cfg = config()
+    if a.pending:
+        names = [r[0] for r in c.execute("select name from reviews where verdict in ('skipped','error')")]
+    elif a.changed:
+        names = [r["name"] for r in changed_since_review(c)]
+    elif a.all:
+        names = [r[0] for r in c.execute("select name from skills order by name")]
+    else:
+        names = a.skills
+    if not names:
+        die("name skills, or --all / --pending / --changed")
+    review_pass(c, cfg, names, static=a.static, quiet=a.quiet)
+
+
+def review_pass(c, cfg, names: list, static: bool = False, quiet: bool = True):
+    """Vet each named bank skill (scan, egress, reviewer) and record the verdict; nothing is removed. Used by
+    `review` and by the nightly tidy pass for skills that changed since their last review."""
+    tally = {"ok": 0, "blocked": 0}
+    for n in names:
+        r = get(c, n)
+        p = bank_path(r["name"])
+        if not (p / "SKILL.md").is_file():
+            continue
+        rep = vet(c, cfg, p, r["name"], review=not static, quiet=quiet, allow_risky=True)
+        record_review(c, r["name"], rep)
+        c.execute("update skills set risk=? where name=?", (rep["level"], r["name"]))
+        tally["ok" if not rep["unapproved"] and rep["review"]["verdict"] != "fail" else "blocked"] += 1
+        c.commit()
+    say(f"reviewed {len(names)}: {tally['ok']} clean, {tally['blocked']} need a decision (unapproved egress or a"
+        f" failed review); `skills-gate net` lists the egress")
+
+
+def changed_since_review(c) -> list:
+    out = []
+    for r in c.execute("select s.name, s.link, v.hash from skills s left join reviews v on v.name=s.name").fetchall():
+        p = bank_path(r["name"])
+        if (p / "SKILL.md").is_file() and (r["hash"] is None or tree_hash(p) != r["hash"]):
+            out.append(r)
+    return out
+
+
+def cmd_quarantine(a):
+    qdir = HOME / "quarantine"
+    entries = sorted(qdir.iterdir()) if qdir.is_dir() else []
+    if a.action in (None, "list"):
+        for e in entries:
+            rep = json.loads((e / ".skills-gate-report.json").read_text()) if (e / ".skills-gate-report.json").is_file() else {}
+            say(f"{e.name:<44} {'; '.join(rep.get('blocks', []))[:110] or '-'}")
+        say(f"{len(entries)} held in {qdir}" + ("; release: skills-gate quarantine release <entry> [--allow-net]"
+                                                 " [--allow-risky]" if entries else ""))
+        return
+    if a.action == "rm":
+        for e in entries:
+            if a.all or e.name in a.entries:
+                rm(e)
+                say(f"[rm]    {e.name}")
+        return
+    c = db()
+    cfg = config()
+    for name in a.entries:
+        e = qdir / name
+        if not (e / "SKILL.md").is_file():
+            die(f"no quarantined skill {name}")
+        rep = json.loads((e / ".skills-gate-report.json").read_text()) if (e / ".skills-gate-report.json").is_file() else {}
+        meta = rep.get("meta", {})
+        skill = rep.get("name") or frontmatter(e / "SKILL.md").get("name") or name
+        res = vet(c, cfg, e, skill, allow_risky=a.allow_risky, allow_net=a.allow_net)
+        if not res["ok"]:
+            c.commit()
+            say(f"[held]  {name} stays in quarantine")
+            continue
+        (e / ".skills-gate-report.json").unlink(missing_ok=True)
+        register(c, e, meta.get("lane"), force=True, source=meta.get("source", str(e)), ref=meta.get("ref", ""),
+                 name=skill, kind="release")
+        record_review(c, skill, res)
+        rm(e)
+    write_registry(c, cfg)
+    c.commit()
 
 
 # ---------------------------------------------------------------------------------------------------- commands
@@ -935,8 +1265,8 @@ def cmd_add(a):
         dirs = find_skill_dirs(Path(src))
         if not dirs:
             die(f"no SKILL.md found in {src}")
-        added = install_dirs(c, dirs, remote=False, yes=True, allow_risky=True, lane=a.lane, link=a.link,
-                             force=a.force, only=a.only)
+        added = install_dirs(c, dirs, remote=False, yes=True, allow_risky=a.allow_risky, lane=a.lane, link=a.link,
+                             force=a.force, only=a.only, allow_net=a.allow_net)
     else:
         catalog_tables(c)
         bad = c.execute("select * from market where status='fail' and (id=? or repo||'/'||path=? or"
@@ -954,7 +1284,7 @@ def cmd_add(a):
             if not dirs:
                 die(f"no SKILL.md found in {src}")
             added = install_dirs(c, dirs, remote=True, yes=a.yes, allow_risky=a.allow_risky, lane=a.lane,
-                                 force=a.force, only=(a.only or []) + only, ref=ref,
+                                 force=a.force, only=(a.only or []) + only, ref=ref, allow_net=a.allow_net,
                                  source_of=lambda d: f"{url}#{d.relative_to(repo) or '.'}@{commit}")
     write_registry(c, cfg)
     c.commit()
@@ -1476,11 +1806,28 @@ def validate_entry(c, row, force: bool = False) -> tuple[str, list[str]]:
         text = http_text(f"https://raw.githubusercontent.com/{row['repo']}/{meta['branch']}/{urllib.parse.quote(path)}")
     except OSError as e:
         return mark_failed(c, row, [f"SKILL.md unreadable: {e}"])
+    folder0 = str(Path(path).parent)
     with tempfile.TemporaryDirectory(prefix="skills-gate-") as td:
         md = Path(td) / "SKILL.md"
         md.write_text(text)
+        fetched = 0
+        for p, s_, _ in files:  # its scripts too (raw reads cost no API quota), so egress and telemetry show
+            if fetched >= 8 or s_ > 200_000 or Path(p).suffix.lower() not in SCRIPT_EXT:
+                continue
+            if folder0 != "." and not p.startswith(folder0 + "/") or folder0 == "." and "/" in p:
+                continue
+            rel = p[len(folder0) + 1:] if folder0 != "." else p
+            try:
+                body_ = http_text(f"https://raw.githubusercontent.com/{row['repo']}/{meta['branch']}/"
+                                  f"{urllib.parse.quote(p)}", limit=200_000)
+            except OSError:
+                continue
+            (Path(td) / rel).parent.mkdir(parents=True, exist_ok=True)
+            (Path(td) / rel).write_text(body_)
+            fetched += 1
         fm = frontmatter(md)
         findings = scan_tree(Path(td))
+        eg = egress(Path(td))
     name, desc = fm.get("name", ""), re.sub(r"\s+", " ", fm.get("description", "")).strip()
     body = re.sub(r"^﻿?---\s*\n.*?\n---\s*\n", "", text, count=1, flags=re.S)
 
@@ -1520,6 +1867,11 @@ def validate_entry(c, row, force: bool = False) -> tuple[str, list[str]]:
         reasons.append(f"{len(scripts)} script(s); the install scan reads them")
     if sum(s for _, s in sibs) > 20_000_000:
         flag("medium", "folder over 20 MB")
+    if eg["telemetry"]:
+        flag("medium", f"telemetry code: {', '.join(eg['telemetry'][:2])}")
+    if eg["hosts"] or eg["unknown"]:
+        flag("medium", "calls out to " + (", ".join(list(eg["hosts"])[:4]) or "hosts built at run time")
+             + " (needs your approval: local first)")
     if meta["archived"]:
         flag("medium", "repo archived")
     if not meta["license"]:
@@ -1666,6 +2018,16 @@ def cmd_use(a):
     touch(c, r["name"], "use")
     c.commit()
     say(f"<!-- skills-gate use {r['name']} | folder: {p} | lane: {r['lane']} -->")
+    cfg = config()
+    eg = egress(p)
+    need = unapproved(c, cfg, r["name"], eg) if cfg["trust"].get("egress", "deny") != "allow" else []
+    if need:
+        say(f"<!-- skills-gate: NETWORK NOT APPROVED for {r['name']}. Its files call: {', '.join(need)}"
+            f"{' (and telemetry)' if eg['telemetry'] else ''}. Do not run any command or script of this skill that"
+            f" reaches those hosts. Ask the user first; they approve with `skills-gate net allow {r['name']}"
+            f" <host>`. Local and tailnet addresses are fine. -->")
+        event(c, r["name"], "net-block", ",".join(need))
+        c.commit()
     sys.stdout.write(md.read_text(encoding="utf-8", errors="replace"))
     extra = sorted(str(rel) for f, rel in files_of(p) if f.name != "SKILL.md")
     if extra:
@@ -2121,6 +2483,15 @@ def cmd_tidy(a):
             say(f"[broken] {r['name']}: {p} has no SKILL.md (a linked source moved?)")
     if not dry:
         reindex(c)
+    changed = changed_since_review(c)
+    if changed and not dry and cfg["trust"].get("review_cmd"):
+        cap = int(cfg["trust"].get("nightly_review", 20))
+        names = [r["name"] for r in changed][:cap]
+        say(f"[review] vetting {len(names)} of {len(changed)} changed or never-reviewed skill(s)")
+        review_pass(c, cfg, names)
+    elif changed:
+        say("[review] " + ", ".join(r["name"] for r in changed[:10]) + (", ..." if len(changed) > 10 else "")
+            + " never reviewed or changed since; run `skills-gate review --changed`")
     keep = always_on(cfg)
     leaks = [(h, e.name) for h, d in harness_dirs(cfg).items() for e in d.iterdir()
              if not e.name.startswith(".") and e.name not in keep and (e / "SKILL.md").is_file()
@@ -2184,6 +2555,13 @@ def cmd_stats(a):
     soon = c.execute("select count(*) from skills where pinned=0 and max(added_at, coalesce(last_used,0)) < ? and"
                      " name not in (select skill from refs)", (now() - (cfg["cold_days"] - 30) * DAY,)).fetchone()[0]
     say(f"bank: {total} skills, {never} never used, {soon} going cold within 30 days")
+    tr = {k: n for k, n in c.execute("select kind, count(*) from events where kind in"
+                                      " ('net-block','net-allow','net-revoke','held') and at>=? group by kind", (since,))}
+    say("trust: " + (", ".join(f"{k} {v}" for k, v in sorted(tr.items())) or "nothing blocked, nothing approved"))
+    revs = c.execute("select verdict, count(*) n from reviews where verdict<>'none' and at>=? group by verdict"
+                     " order by n desc", (since,)).fetchall()
+    if revs:
+        say("reviews: " + ", ".join(f"{r['verdict']} {r['n']}" for r in revs))
     sug = c.execute("select at, detail from events where kind='suggest' and at>=?", (since,)).fetchall()
     if sug:
         hit = 0
@@ -2265,6 +2643,11 @@ def cmd_doctor(a):
             say(f"BAD {r[0]}: no SKILL.md in the bank")
     for r in c.execute("select name, risk from skills where risk='high' order by name"):
         say(f"warn {r[0]}: high-risk scan findings (skills-gate scan {r[0]})")
+    pend = [r["name"] for r in changed_since_review(c)]
+    if pend:
+        say(f"warn {len(pend)} skill(s) unreviewed or changed since review: {', '.join(pend[:8])}")
+    if (HOME / "quarantine").is_dir() and any((HOME / "quarantine").iterdir()):
+        say(f"note {len(list((HOME / 'quarantine').iterdir()))} skill(s) in quarantine (skills-gate quarantine)")
     say("doctor: " + ("all good" if not bad else f"{bad} problem(s)"))
     raise SystemExit(1 if bad else 0)
 
@@ -2450,11 +2833,9 @@ def cmd_update(a):
                     f" keeping the old copy in cold/")
                 continue
             changes = sum(1 for ln in tree_diff(bank_path(e["name"]), e["dir"], "a", "b") if ln.startswith("+++"))
-            f = scan_tree(e["dir"])
             say(f"[new]   {e['name']}: {changes} file(s) change")
-            print_scan(e["name"], e["dir"], f, limit=6)
-            if scan_level(f) == "high" and not a.allow_risky:
-                say(f"[block] {e['name']}: high-risk findings in the new version; --allow-risky after reading them")
+            e["rep"] = vet(c, cfg, e["dir"], e["name"], allow_risky=a.allow_risky, allow_net=a.allow_net)
+            if not e["rep"]["ok"]:
                 continue
             plan.append(e)
         if not plan:
@@ -2468,6 +2849,7 @@ def cmd_update(a):
             keep_copy(e["name"], "pre-update")
             register(c, e["dir"], force=True, source=e["source"], ref=e["ref"], kind="update",
                      name=e["name"])
+            record_review(c, e["name"], e["rep"])
     write_registry(c, cfg)
     c.commit()
     say(f"updated {len(plan)} skill(s); old copies in {COLD}")
@@ -2531,7 +2913,19 @@ def sync_merge(c, reg: dict, policy: str) -> dict:
     """Three-way merge per skill: base = the hash both sides had at the last sync."""
     base = {r[0]: r[1] for r in c.execute("select name, hash from sync_state")}
     local = {r["name"]: r for r in c.execute("select * from skills")}
-    stats = {"new": 0, "took": 0, "kept": 0, "conflict": 0, "removed": 0}
+    stats = {"new": 0, "took": 0, "kept": 0, "conflict": 0, "removed": 0, "held": 0}
+    cfg = config()
+    for skill, hosts in reg.get("net_allow", {}).items():
+        c.executemany("insert or ignore into net_allow values (?,?,?,?)", [(skill, h, now(), "sync") for h in hosts])
+
+    def admit(rdir: Path, name: str, meta: dict) -> bool:
+        rep = vet(c, cfg, rdir, name, review=False, quiet=True)
+        if rep["ok"]:
+            return True
+        q = quarantine(rdir, name, rep, dict(meta, source=meta.get("source", "")))
+        say(f"[held]  {name} from the remote failed vetting ({'; '.join(rep['blocks'])}); in {q}")
+        stats["held"] += 1
+        return False
     for name, info in reg.get("skills", {}).items():
         if not NAME_RX.match(name):
             continue
@@ -2558,6 +2952,8 @@ def sync_merge(c, reg: dict, policy: str) -> dict:
             if ls and (Path(ls) / "SKILL.md").is_file():
                 register(c, Path(ls), link=True, source=info.get("source", ""), kind="pull", meta=meta)
             elif have_copy:
+                if not admit(rdir, name, dict(meta, source=info.get("source", ""))):
+                    continue
                 register(c, rdir, source=info.get("source", ""), kind="pull", meta=meta)
             else:
                 warn(f"{name}: listed by the remote but its files are missing there; skipped")
@@ -2581,6 +2977,8 @@ def sync_merge(c, reg: dict, policy: str) -> dict:
             stats["kept"] += 1
             continue
         if hb == hl or policy == "theirs":
+            if not admit(rdir, name, dict(meta, source=info.get("source", row["source"]))):
+                continue
             keep_copy(name, "pre-pull")
             register(c, rdir, force=True, source=info.get("source", row["source"]), kind="pull", meta=meta,
                      name=name)
@@ -2649,6 +3047,9 @@ def sync_export(c, remote: dict):
         c.execute("insert or replace into sync_state values (?,?)", (name, h))
     for row in c.execute("select name, group_concat(skill, '\n') s from presets group by name"):
         reg["presets"][row["name"]] = sorted(row["s"].split("\n"))
+    reg["net_allow"] = {}
+    for row in c.execute("select skill, host from net_allow where by != 'global' order by skill, host"):
+        reg["net_allow"].setdefault(row["skill"], []).append(row["host"])
     (SYNC / "registry.json").write_text(json.dumps(reg, indent=1, sort_keys=True) + "\n")
 
 
@@ -2840,6 +3241,7 @@ def main(argv=None):
     p.add_argument("--force", action="store_true", help="replace a skill already in the bank")
     p.add_argument("--yes", action="store_true", help="the user agreed to this remote install")
     p.add_argument("--allow-risky", action="store_true", help="install even with high-risk scan findings")
+    p.add_argument("--allow-net", action="store_true", help="approve the external hosts this skill calls")
     p.set_defaults(f=cmd_add)
     p = sp.add_parser("adopt", help="import every skill found in existing skill folders")
     p.add_argument("paths", nargs="+")
@@ -2891,6 +3293,27 @@ def main(argv=None):
     p.add_argument("--limit", type=int, default=30)
     p.add_argument("--all", action="store_true", help="include entries that failed validation")
     p.set_defaults(f=cmd_market)
+    p = sp.add_parser("net", help="egress: list skills that call out | allow SKILL [HOSTS] | revoke SKILL [HOSTS] | hosts")
+    p.add_argument("action", nargs="?", choices=["list", "allow", "revoke", "hosts"])
+    p.add_argument("skill", nargs="?")
+    p.add_argument("hosts", nargs="*")
+    p.add_argument("--all", action="store_true", help="also list skills whose egress is approved")
+    p.set_defaults(f=cmd_net)
+    p = sp.add_parser("review", help="vet bank skills again: scan, egress, reviewer; records the result")
+    p.add_argument("skills", nargs="*")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--pending", action="store_true", help="skills whose reviewer could not run last time")
+    p.add_argument("--changed", action="store_true", help="skills changed since their last review")
+    p.add_argument("--static", action="store_true", help="scan and egress only, skip the reviewer")
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(f=cmd_review)
+    p = sp.add_parser("quarantine", help="skills held back by vetting: list | release ENTRY [--allow-net] | rm ENTRY")
+    p.add_argument("action", nargs="?", choices=["list", "release", "rm"])
+    p.add_argument("entries", nargs="*")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--allow-net", action="store_true")
+    p.add_argument("--allow-risky", action="store_true")
+    p.set_defaults(f=cmd_quarantine)
     p = sp.add_parser("use", help="print a skill's playbook into the session (on demand)")
     p.add_argument("skill")
     p.set_defaults(f=cmd_use)
@@ -2959,6 +3382,7 @@ def main(argv=None):
     p.add_argument("--yes", action="store_true")
     p.add_argument("--force", action="store_true", help="overwrite local edits")
     p.add_argument("--allow-risky", action="store_true")
+    p.add_argument("--allow-net", action="store_true", help="approve the external hosts the new version calls")
     p.set_defaults(f=cmd_update)
     p = sp.add_parser("remote", help="show or set the git remote the bank syncs through")
     p.add_argument("url", nargs="?")
