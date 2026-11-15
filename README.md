@@ -90,8 +90,8 @@ so an agent can choose without a second call. Harnesses without a shell can use 
 - **References hold skills.** A skill named in your role prompts (`skills-gate/bank/<x>`,
   `skills-gate use <x>`), linked from another tool's folder, or listed in a project manifest never
   goes cold. `remove` refuses it without `--force`, and `show` says who depends on it.
-- **`stats`.** Loads per harness, the most used skills, what goes cold in the next 30 days, and the
-  suggestion hit rate.
+- **`stats`.** Loads per harness, the most used skills, what goes cold in the next 30 days, the
+  suggestion hit rate, and what the trust layer did in the window: blocked calls, approvals, holds.
 
 **Installs carefully**
 - **A marketplace you can trust offline.** A local catalog of every skill skills.sh lists (20,000 on
@@ -107,6 +107,26 @@ so an agent can choose without a second call. Harnesses without a shell can use 
 - **Updates you can read first.** Remote installs record `url#path@commit`. `outdated` checks
   upstream with `git ls-remote`, `diff` shows the change, and `update` scans the new version,
   keeps the old copy in `cold/` and refuses to overwrite your local edits without `--force`.
+
+**Never calls out without approval**
+- **Egress needs your yes.** Every bank skill is scanned for the hosts it would dial. The default
+  policy is `deny`: a skill that calls an external host is held at install, and `use` prints a
+  warning telling the agent not to run its network commands until you approve (`skills-gate net`,
+  `skills-gate net allow <skill> [host]`). Local and tailnet addresses never count, and XML
+  namespace URIs (OOXML, W3C, Dublin Core) are recognized as identifiers, not call targets.
+- **Quarantine first.** A new or updated skill is vetted in `quarantine/`: install scan, egress
+  against your approvals, then an optional local-model reviewer. Nothing reaches the bank while a
+  block stands; `quarantine release <entry>` after you read the report.
+- **A local reviewer, not a cloud one.** Point `trust.review_cmd` at any command that reads the
+  skill folder and answers one JSON line. The bundled `skills-gate-review` asks your llama-swap
+  `review` model to judge the skill as untrusted agent content: telemetry, exfiltration, prompt
+  injection, obfuscation. The skill is read, never run; when the model is down the verdict is
+  `skipped`, never a guess. `review --changed` vets by hand; with a reviewer configured the
+  nightly `tidy` reviews up to `trust.nightly_review` changed skills by itself.
+- **The gate skill states the rule.** Every harness sees the same instruction: a skill never
+  calls out without your approval, and agents may never pass `--allow-net` or `--allow-risky`.
+- **You can audit the week.** Blocked uses, approvals, revokes and holds land in an event log;
+  `stats --days 7` sums them next to usage and the suggestion hit rate.
 
 **Fits how you work**
 - **Project manifests.** `.skills-gate.json` lists a project's skills and where to get them.
@@ -201,6 +221,9 @@ choosing the right skill matter more than seeing every skill at once. They can s
 | `add <folder \| git-url \| owner/repo[/path][:skill][@ref]>` | Install: scan, ask, bank. `--yes`, `--allow-risky`, `--only`, `--link`, `--lane` |
 | `adopt <folders>` | Bank every skill already sitting in existing folders |
 | `scan <skill \| folder>` / `audit` | Install checks on one skill / on the whole bank |
+| `net [list \| allow \| revoke \| hosts]` | Which skills call out, and what you approved |
+| `review <skills \| --all \| --changed> [--static]` | Vet bank skills again: scan, egress, reviewer |
+| `quarantine [list \| release \| rm]` | Skills held back by vetting |
 | `outdated` / `diff <skill>` / `update <skills \| --all>` | Upstream changes, read them, take them |
 | `project show \| save \| sync` | The project's `.skills-gate.json` |
 | `preset list \| show \| save \| add \| rm` | Named skill sets |
@@ -210,7 +233,7 @@ choosing the right skill matter more than seeing every skill at once. They can s
 | `pin` / `unpin` / `remove <skills>` | Exempt from pruning / move to cold storage |
 | `tidy [--fix] [--dry-run]` | The nightly pass; `--fix` re-gates leaks |
 | `harvest [--reset]` | Count skill loads from session logs now; `--reset` recounts everything |
-| `stats` / `bench <file>` | Usage and suggestion hit rate / ranker quality on your prompts |
+| `stats [--days N]` / `bench <file>` | Usage, trust events and suggestion hit rate / ranker quality on your prompts |
 | `status` / `doctor` / `show <skill>` | Inspect |
 | `mcp` / `timer` / `reindex` | MCP server / install the nightly timer / re-read every skill |
 
@@ -230,12 +253,19 @@ to leave it alone.
   "ref_roots": ["~/dotfiles/agents/prompts"],
   "marketplace": ["skills.sh", "gh-skill"],
   "market": {"sources": ["skills.sh"], "repos": ["my-org/agent-skills"], "budget": 400, "revalidate_days": 14},
-  "suggest": {"limit": 3, "min_score": 7.0, "ratio": 0.55}
+  "suggest": {"limit": 3, "min_score": 7.0, "ratio": 0.55},
+  "trust": {"egress": "deny", "allow_hosts": [], "review_cmd": "", "review_timeout": 600,
+            "review_pending": "allow", "nightly_review": 20}
 }
 ```
 
 `min_score` fits a bank of about 150 skills; skills-gate scales it down for smaller banks. Raise it
 if suggestions feel noisy, and check the effect with `bench`.
+
+`trust.egress` is `deny` (default), `warn` or `allow`. `allow_hosts` applies to every skill; the
+per-skill approvals live in the database and travel with `push` / `pull`. `review_cmd` gets the
+skill folder plus its name and answers one JSON line; the bundled `skills-gate-review` (llama-swap
+on this box by default) is the usual value.
 
 ## Layout
 
