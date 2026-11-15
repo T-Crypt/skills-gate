@@ -550,6 +550,20 @@ class ReviewRegressionTest(Base):
         self.assertIn("[cold]  code-review", out)  # nobody used this one
         self.assertIn("video-cut", self.sg("show", "video-cut").stdout)
 
+    def test_a_skills_own_gitignore_does_not_hide_files_from_peers(self):
+        home2, env2 = self.two_machines()
+        d = skill(self.tmp / "gi", "fixtures-skill", "Has a gitignore and fixtures")
+        (d / ".gitignore").write_text("transcript.json\n")
+        (d / "transcript.json").write_text("{}\n")
+        self.sg("add", str(d))
+        self.sg("push")
+        self.sg("pull", env=env2)
+        self.assertTrue((home2 / ".skills-gate" / "bank" / "fixtures-skill" / "transcript.json").is_file())
+        self.sg("push", env=env2)  # machine 2 reports in as a peer
+        self.sg("push")
+        self.assertIn("nothing changed", self.sg("push", env=env2).stdout)
+        self.assertIn("nothing changed", self.sg("push").stdout)
+
     def test_peers_and_join(self):
         home2, env2 = self.two_machines()
         self.sg("push", env=env2)

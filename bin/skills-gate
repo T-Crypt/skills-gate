@@ -3234,7 +3234,9 @@ def cmd_push(a):
         write_registry(c, config())
         install_gate(config())
         c.commit()
-        sync_git(["add", "-A"])
+        # --force: a skill's own .gitignore (fixtures, outputs) must not hide files the bank's hash counts,
+        # or the peer never gets them and the two machines overwrite each other on every push
+        sync_git(["add", "-A", "--force"])
         if sync_git(["diff", "--cached", "--quiet"], check=False).returncode == 0:
             say("push: nothing changed")
             return
