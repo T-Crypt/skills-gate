@@ -910,7 +910,8 @@ def cmd_init(a):
     if not CONFIG.exists():
         cfg = json.loads(json.dumps(DEFAULT_CONFIG))
         for name, info in KNOWN_AGENTS.items():
-            if name not in cfg["harness_dirs"] and not info.get("manual") and Path(info["global"]).expanduser().is_dir():
+            if name not in cfg["harness_dirs"] and not info.get("manual") and Path(info["global"]).expanduser().is_dir() \
+                    and name not in cfg.get("ignore_agents", []):
                 cfg["harness_dirs"][name] = info["global"]
         CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
         say(f"[write] {CONFIG}")
@@ -2277,16 +2278,19 @@ def cmd_timer(a):
             f"{exe} market refresh >> {HOME}/tidy.log 2>&1")
         return
     unit_dir.mkdir(parents=True, exist_ok=True)
+    c = db()
+    push = f"ExecStart=-{sys.executable} {exe} push\n" if meta_get(c, "remote") else ""
     (unit_dir / "skills-gate-tidy.service").write_text(
         f"[Unit]\nDescription=skills-gate daily tidy\n\n[Service]\nType=oneshot\n"
         f"ExecStart={sys.executable} {exe} tidy --fix\n"
-        f"ExecStart=-{sys.executable} {exe} market refresh\nNice=10\n")
+        f"ExecStart=-{sys.executable} {exe} market refresh\n{push}Nice=10\n")
     (unit_dir / "skills-gate-tidy.timer").write_text(
         "[Unit]\nDescription=skills-gate daily tidy\n\n[Timer]\nOnCalendar=*-*-* 04:17\nPersistent=true\n"
         "RandomizedDelaySec=10min\n\n[Install]\nWantedBy=timers.target\n")
     subprocess.run(["systemctl", "--user", "daemon-reload"])
     subprocess.run(["systemctl", "--user", "enable", "--now", "skills-gate-tidy.timer"])
-    say("[timer] skills-gate-tidy.timer enabled (daily 04:17: tidy, then the market catalog refresh)")
+    say("[timer] skills-gate-tidy.timer enabled (daily 04:17: tidy, the market catalog refresh"
+        + (", then push to the sync remote)" if push else "); set a remote and rerun to sync nightly"))
 
 
 # ---------------------------------------------------------------------------------------------------- scan / audit
@@ -2506,7 +2510,7 @@ def cmd_remote(a):
         sync_git(["remote", "add", "origin", a.url])
     else:
         sync_git(["remote", "set-url", "origin", a.url])
-    say(f"[remote] {a.url}; `skills-gate pull` then `skills-gate push`")
+    say(f"[remote] {a.url}; `skills-gate pull` then `skills-gate push`; rerun `skills-gate timer` to sync nightly")
 
 
 def sync_fetch(c) -> dict:
@@ -2684,7 +2688,10 @@ def cmd_agents(a):
     cfg = config()
     if a.action in (None, "list"):
         say(f"{'agent':<10} {'state':<10} {'skills':>6}  folder")
+        ignored = set(cfg.get("ignore_agents", []))
         for name, info in KNOWN_AGENTS.items():
+            if name in ignored:
+                continue
             path = Path(cfg["harness_dirs"].get(name) or info["global"]).expanduser()
             gated = bool(cfg["harness_dirs"].get(name)) and path.is_dir()
             state = "gated" if gated else "detected" if Path(info["home"]).expanduser().is_dir() else "-"
@@ -2694,7 +2701,8 @@ def cmd_agents(a):
         for name, p in cfg["harness_dirs"].items():
             if name not in KNOWN_AGENTS and p:
                 say(f"{name:<10} {'gated':<10} {'':>6}  {Path(p).expanduser()}  (custom)")
-        say("\nadd one: skills-gate agents add <name> [--dir PATH], then `skills-gate gate`")
+        say("\nadd one: skills-gate agents add <name> [--dir PATH], then `skills-gate gate`"
+            + (f"; hidden: {', '.join(sorted(ignored))}" if ignored else ""))
         return
     if not a.name:
         die(f"agents {a.action} needs a name")
@@ -2714,6 +2722,14 @@ def cmd_agents(a):
                 u.setdefault("usage_sources", {})[a.name] = info["sessions"]
         edit_config(add)
         say(f"[agent] {a.name} -> {path}; run `skills-gate gate` to move its skills behind the gate")
+    elif a.action == "ignore":
+        def ign(u):
+            names = set(u.get("ignore_agents", [])) | {a.name}
+            u["ignore_agents"] = sorted(names)
+            if u.get("harness_dirs", {}).get(a.name):
+                u["harness_dirs"][a.name] = ""
+        edit_config(ign)
+        say(f"[agent] {a.name} hidden from `agents` and never gated")
     elif a.action == "remove":
         edit_config(lambda u: u.setdefault("harness_dirs", {}).__setitem__(a.name, ""))
         say(f"[agent] {a.name} is no longer gated; its folder keeps what is there (`ungate` restores moved skills)")
@@ -2954,8 +2970,8 @@ def main(argv=None):
         g.add_argument("--theirs", action="store_true", help="on a conflict, take the remote copy")
         g.add_argument("--mine", action="store_true", help="on a conflict, keep this machine's copy")
         p.set_defaults(f=fn)
-    p = sp.add_parser("agents", help="known harnesses: list | add NAME [--dir] | remove NAME")
-    p.add_argument("action", nargs="?", choices=["list", "add", "remove"])
+    p = sp.add_parser("agents", help="known harnesses: list | add NAME [--dir] | remove NAME | ignore NAME")
+    p.add_argument("action", nargs="?", choices=["list", "add", "remove", "ignore"])
     p.add_argument("name", nargs="?")
     p.add_argument("--dir")
     p.add_argument("--no-project", action="store_true", help="do not add its project folder to project_dirs")

@@ -116,7 +116,8 @@ so an agent can choose without a second call. Harnesses without a shell can use 
   `on --preset review-kit` or `on --lane media`.
 - **One bank on every machine.** `remote <git-url>`, then `push` and `pull`. A three-way merge
   per skill takes the side that changed; when both changed, skills-gate keeps yours, saves theirs
-  in `conflicts/` and waits for `--theirs` or `--mine`. Secrets (`.env`, keys, tokens) and files
+  in `conflicts/` and waits for `--theirs` or `--mine`. With a remote set, `skills-gate timer`
+  adds a nightly `push` (which pulls and merges first). Secrets (`.env`, keys, tokens) and files
   over 10 MB stay home, and an empty remote never empties your bank.
 - **16 known harnesses.** `agents` lists Claude Code, the shared `~/.agents` folder, Codex,
   OpenCode, Pi, OMP, Cursor, Gemini, Copilot, Windsurf, Roo, Cline, Goose, Kiro, Qwen and Trae,
@@ -204,7 +205,7 @@ choosing the right skill matter more than seeing every skill at once. They can s
 | `project show \| save \| sync` | The project's `.skills-gate.json` |
 | `preset list \| show \| save \| add \| rm` | Named skill sets |
 | `remote <url>` / `push` / `pull [--theirs \| --mine]` | Sync the bank through git |
-| `agents [add \| remove] <name>` | Known harnesses and which ones are gated |
+| `agents [add \| remove \| ignore] <name>` | Known harnesses and which ones are gated; `ignore` hides one for good |
 | `lane [name]` / `set-lane <lane> <skills>` | Read or change the lanes |
 | `pin` / `unpin` / `remove <skills>` | Exempt from pruning / move to cold storage |
 | `tidy [--fix] [--dry-run]` | The nightly pass; `--fix` re-gates leaks |

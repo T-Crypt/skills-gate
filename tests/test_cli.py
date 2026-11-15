@@ -458,6 +458,9 @@ class MarketAndAgentsTest(Base):
         self.assertIn(".cursor/skills", cfg["project_dirs"])
         self.sg("gate")
         self.assertIn("skills-gate", self.listing(self.home / ".cursor" / "skills"))
+        self.sg("agents", "ignore", "cursor")
+        self.assertNotRegex(self.sg("agents").stdout, r"(?m)^cursor ")
+        self.assertEqual(json.loads((self.sgh / "config.json").read_text())["harness_dirs"]["cursor"], "")
 
 
 class ReviewRegressionTest(Base):
