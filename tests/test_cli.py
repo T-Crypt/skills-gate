@@ -567,8 +567,13 @@ class ReviewRegressionTest(Base):
         self.assertIn("in step", out)
         self.assertEqual(self.listing(home3 / ".skills-gate" / "bank"), self.listing(self.sgh / "bank"))
         self.assertIn("keep-me", self.cfg2(home3)["always_on"])
-        # a quiet push makes no commit
+        # a quiet push makes no commit, and peers with a copy of a linked skill do not fight over its path
         self.assertIn("nothing changed", self.sg("push", env=env3).stdout)
+        self.sg("push")
+        self.assertIn("nothing changed", self.sg("push", env=env3).stdout)
+        self.assertIn("nothing changed", self.sg("push").stdout)
+        reg = json.loads((self.sgh / "sync" / "registry.json").read_text())
+        self.assertTrue(reg["skills"]["lab-ops"]["link_source"])
 
     def test_broken_link_on_one_machine_never_removes_it_elsewhere(self):
         home2, env2 = self.two_machines()

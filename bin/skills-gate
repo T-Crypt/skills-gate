@@ -3192,9 +3192,10 @@ def sync_export(c, remote: dict):
             (dst / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(f, dst / rel)
         h = sync_hash(p)
+        # a peer holding a copy keeps the linking peer's path, or the two would rewrite it on every push
+        ls = str(p.resolve()) if r["link"] else remote.get("skills", {}).get(name, {}).get("link_source", "")
         reg["skills"][name] = {"lane": r["lane"], "description": r["description"], "source": r["source"],
-                               "link_source": str(p.resolve()) if r["link"] else "", "pinned": r["pinned"],
-                               "hash": h}
+                               "link_source": ls, "pinned": r["pinned"], "hash": h}
         c.execute("insert or replace into sync_state values (?,?)", (name, h))
     reg["version"] = 3
     for ns in ("config", "net_allow", "presets", "attrs"):
