@@ -128,6 +128,24 @@ so an agent can choose without a second call. Harnesses without a shell can use 
 - **You can audit the week.** Blocked uses, approvals, revokes and holds land in an event log;
   `stats --days 7` sums them next to usage and the suggestion hit rate.
 
+**Learns from your work**
+- **Workflows you repeat become skill drafts.** Once a week the tidy mines the last 14 days of
+  session logs from every harness and every project on the machine, the same tool-call arguments
+  usage counting reads, never message text. Each shell call becomes a command shape (program,
+  subcommands, flags; paths and values dropped), and shapes that run together in 5 sessions across
+  2 projects become one candidate workflow. Shell built-ins, ad-hoc `python3 -c` scripts and git
+  plumbing are not workflows on their own. A candidate a bank skill already covers is shown as
+  covered and never drafted.
+- **Drafts, not installs.** Up to 3 drafts a week land in `~/.skills-gate/drafts`, with secrets
+  redacted (tokens, `*_TOKEN=` values, auth headers, URL credentials). Set `distill.draft_cmd` to
+  the bundled `skills-gate-draft` and a local model (llama-swap `agent` by default) writes the
+  playbook: steps, why each runs, how to tell it worked. Without it, or when the model is down,
+  you get a plain template. `distill show NAME` to read one, edit it in place, then
+  `distill accept NAME [--lane L]` (full vetting, then the bank, then your other machines on the
+  next sync) or `distill reject NAME` (never proposed again, on any peer).
+- **By hand.** `skills-gate distill --dry-run` lists what recurs and what already covers it;
+  `--days 30` widens the window.
+
 **Fits how you work**
 - **Project manifests.** `.skills-gate.json` lists a project's skills and where to get them.
   Commit it; `project sync` on another machine installs what is missing and links the rest.
@@ -246,6 +264,7 @@ choosing the right skill matter more than seeing every skill at once. They can s
 | `harvest [--reset]` | Count skill loads from session logs now; `--reset` recounts everything |
 | `stats [--days N]` / `bench <file>` | Usage, trust events and suggestion hit rate / ranker quality on your prompts |
 | `status` / `doctor` / `show <skill>` | Inspect |
+| `distill [run \| list \| show \| accept \| reject] [NAME]` | Turn workflows you repeat across projects into skill drafts; accept one into the bank |
 | `mcp` / `timer` / `reindex` | MCP server / install the nightly timer / re-read every skill |
 
 ## Config
@@ -266,7 +285,9 @@ to leave it alone.
   "market": {"sources": ["skills.sh"], "repos": ["my-org/agent-skills"], "budget": 400, "revalidate_days": 14},
   "suggest": {"limit": 3, "min_score": 7.0, "ratio": 0.55},
   "trust": {"egress": "deny", "allow_hosts": [], "review_cmd": "", "review_timeout": 600,
-            "review_pending": "allow", "nightly_review": 20}
+            "review_pending": "allow", "nightly_review": 20},
+  "distill": {"days": 14, "every_days": 7, "min_sessions": 5, "min_projects": 2, "max_drafts": 3,
+              "draft_cmd": "skills-gate-draft", "ignore": ["^kubectl get"]}
 }
 ```
 
@@ -277,6 +298,11 @@ if suggestions feel noisy, and check the effect with `bench`.
 per-skill approvals live in the database and travel with `push` / `pull`. `review_cmd` gets the
 skill folder plus its name and answers one JSON line; the bundled `skills-gate-review` (llama-swap
 on this box by default) is the usual value.
+
+`distill.every_days` set to `0` turns the weekly mining off. `ignore` takes regexes matched
+against a candidate's command shapes. `draft_cmd` gets the candidate as JSON on stdin and prints
+a SKILL.md; the bundled `skills-gate-draft` reads `SKILLS_GATE_LLM_URL` and
+`SKILLS_GATE_DRAFT_MODEL` (default `agent`).
 
 ## Layout
 
@@ -290,6 +316,7 @@ on this box by default) is the usual value.
   lanes/<lane>.md    one line per skill, read by `skills-gate lane`
   skill/skills-gate/ the gate skill, linked into every harness folder
   sync/              the git export `push` and `pull` work through
+  drafts/            skill drafts `distill` mined from your sessions, waiting for accept or reject
   conflicts/<skill>/ the other machine's copy after a conflict
 ```
 
