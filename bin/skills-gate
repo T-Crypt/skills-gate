@@ -4382,8 +4382,53 @@ def cmd_peers(a):
 
 # ---------------------------------------------------------------------------------------------------- agents
 
+def _custom_agents_map(c):
+    try:
+        return {r["key"]: r for r in c.execute("select * from custom_agents").fetchall()}
+    except sqlite3.Error:
+        return {}
+
+
+def _agent_override(cfg, name, key):
+    for container in ("agent_path_overrides", "path_overrides", "agent_paths"):
+        v = (cfg.get(container) or {}).get(name, {})
+        if isinstance(v, dict) and key in v:
+            return v[key]
+    homes = cfg.get("agent_homes") or {}
+    projects = cfg.get("agent_project_dirs") or {}
+    if key == "home" and name in homes:
+        return homes[name]
+    if key == "project" and name in projects:
+        return projects[name]
+    return None
+
+
+def _effective_agent(name, info, cfg, custom_row=None):
+    info = dict(info or {})
+    if custom_row is not None:
+        info.setdefault("home", None)
+        info.setdefault("global", custom_row["skills_dir"])
+        info.setdefault("project", custom_row["project_dir"])
+        info.setdefault("sessions", None)
+    g = cfg.get("harness_dirs", {}).get(name)
+    if g:
+        info["global"] = g
+    s = cfg.get("usage_sources", {}).get(name)
+    if s:
+        info["sessions"] = s
+    h = _agent_override(cfg, name, "home")
+    if h:
+        info["home"] = h
+    p = _agent_override(cfg, name, "project")
+    if p:
+        info["project"] = p
+    return info
+
+
 def cmd_agents(a):
     cfg = config()
+    c = db()
+    custom = _custom_agents_map(c)
     if a.action in (None, "list"):
         say(f"{'agent':<10} {'state':<10} {'skills':>6}  folder")
         ignored = set(cfg.get("ignore_agents", []))
@@ -4391,22 +4436,40 @@ def cmd_agents(a):
         for name, info in KNOWN_AGENTS.items():
             if name in ignored:
                 continue
+            info = _effective_agent(name, info, cfg)
             path = Path(cfg["harness_dirs"].get(name) or info["global"]).expanduser()
             gated = bool(cfg["harness_dirs"].get(name)) and path.is_dir()
-            state = "gated" if gated else "detected" if Path(info["home"]).expanduser().is_dir() else "-"
+            home = info.get("home")
+            home_path = Path(home).expanduser() if home else None
+            state = "gated" if gated else "detected" if (home_path.is_dir() if home_path else path.is_dir()) else "-"
             if state == "-" and not getattr(a, "all", False):
                 absent.append(name)
                 continue
             count = sum(1 for e in path.iterdir() if (e / "SKILL.md").is_file()) if path.is_dir() else 0
             note = f"  ({info['note']})" if info.get("note") else ""
             say(f"{name:<10} {state:<10} {count:>6}  {path}{note}")
+        for key, row in custom.items():
+            if key in ignored:
+                continue
+            if not row["enabled"]:
+                continue
+            info = _effective_agent(key, {}, cfg, row)
+            path = Path(cfg["harness_dirs"].get(key) or info["global"]).expanduser()
+            gated = bool(cfg["harness_dirs"].get(key)) and path.is_dir()
+            state = "gated" if gated else "detected" if path.is_dir() else "-"
+            if state == "-" and not getattr(a, "all", False):
+                absent.append(key)
+                continue
+            count = sum(1 for e in path.iterdir() if (e / "SKILL.md").is_file()) if path.is_dir() else 0
+            say(f"{key:<10} {state:<10} {count:>6}  {path}  (custom)")
         if absent:
             say(f"not on this machine ({len(absent)}, --all lists them): {', '.join(absent)}")
         for name, p in cfg["harness_dirs"].items():
-            if name not in KNOWN_AGENTS and p:
+            if name not in KNOWN_AGENTS and name not in custom and p:
                 say(f"{name:<10} {'gated':<10} {'':>6}  {Path(p).expanduser()}  (custom)")
         say("\nadd one: skills-gate agents add <name> [--dir PATH], then `skills-gate gate`"
             + (f"; hidden: {', '.join(sorted(ignored))}" if ignored else ""))
+        c.close()
         return
     if not a.name:
         die(f"agents {a.action} needs a name")
@@ -4416,15 +4479,25 @@ def cmd_agents(a):
         if not path:
             die(f"unknown agent {a.name!r}; pass --dir with its global skills folder")
         Path(path).expanduser().mkdir(parents=True, exist_ok=True)
+        project = a.project if getattr(a, "project", None) is not None else info.get("project")
+        if getattr(a, "no_project", False):
+            project = None
 
         def add(u):
             u.setdefault("harness_dirs", {})[a.name] = path
             pd = u.setdefault("project_dirs", list(DEFAULT_CONFIG["project_dirs"]))
-            if info.get("project") and info["project"] not in pd and not a.no_project:
-                pd.append(info["project"])
+            if project and project not in pd and not getattr(a, "no_project", False):
+                pd.append(project)
             if info.get("sessions"):
                 u.setdefault("usage_sources", {})[a.name] = info["sessions"]
         edit_config(add)
+        if a.name not in KNOWN_AGENTS:
+            cc = db()
+            cc.execute("insert or replace into custom_agents (key, name, skills_dir, project_dir, enabled, created_at) "
+                       "values (?,?,?,?,?,?)",
+                       (a.name, getattr(a, "agent_name", None) or a.name, path, project, 1, now()))
+            cc.commit()
+            cc.close()
         say(f"[agent] {a.name} -> {path}; run `skills-gate gate` to move its skills behind the gate")
     elif a.action == "ignore":
         def ign(u):
@@ -4435,8 +4508,71 @@ def cmd_agents(a):
         edit_config(ign)
         say(f"[agent] {a.name} hidden from `agents` and never gated")
     elif a.action == "remove":
-        edit_config(lambda u: u.setdefault("harness_dirs", {}).__setitem__(a.name, ""))
+        def rm(u):
+            u.setdefault("harness_dirs", {})[a.name] = ""
+            for container in ("agent_path_overrides", "path_overrides", "agent_paths"):
+                if isinstance(u.get(container), dict) and a.name in u[container]:
+                    del u[container][a.name]
+            for k in ("agent_homes", "agent_project_dirs"):
+                if isinstance(u.get(k), dict) and a.name in u[k]:
+                    del u[k][a.name]
+        edit_config(rm)
+        cc = db()
+        cc.execute("delete from custom_agents where key=?", (a.name,))
+        cc.commit()
+        cc.close()
         say(f"[agent] {a.name} is no longer gated; its folder keeps what is there (`ungate` restores moved skills)")
+    elif a.action == "path":
+        if not a.name or not getattr(a, "key", None) or getattr(a, "value", None) is None:
+            die("agents path needs <name> <key> <value>")
+        key_raw = a.key
+        val = a.value
+        key = key_raw.lower().replace("-", "_")
+        if key in ("global", "skills", "skills_dir", "dir", "skillsdir", "gated_dir", "global_dir"):
+            Path(val).expanduser().mkdir(parents=True, exist_ok=True)
+        if key in ("global", "skills", "skills_dir", "dir", "skillsdir", "gated_dir", "global_dir"):
+            kind = "global"
+        elif key in ("home", "home_dir", "homedir"):
+            kind = "home"
+        elif key in ("project", "project_dir", "project_path", "projectdir"):
+            kind = "project"
+        elif key in ("sessions", "session", "usage", "usage_source", "usage_sources", "logs", "session_logs"):
+            kind = "sessions"
+        else:
+            die(f"unknown path key {key_raw!r}; use home|global|project|sessions")
+
+        def upd(u):
+            u.setdefault("harness_dirs", {})
+            u.setdefault("usage_sources", {})
+            u.setdefault("agent_homes", {})
+            u.setdefault("agent_project_dirs", {})
+            u.setdefault("project_dirs", list(DEFAULT_CONFIG["project_dirs"]))
+            for container in ("agent_path_overrides", "path_overrides", "agent_paths"):
+                u.setdefault(container, {}).setdefault(a.name, {})
+            if kind == "global":
+                u["harness_dirs"][a.name] = val
+            elif kind == "sessions":
+                u["usage_sources"][a.name] = val
+            elif kind == "home":
+                u["agent_homes"][a.name] = val
+            elif kind == "project":
+                u["agent_project_dirs"][a.name] = val
+                pd = u["project_dirs"]
+                if val not in pd:
+                    pd.append(val)
+            for container in ("agent_path_overrides", "path_overrides", "agent_paths"):
+                u[container][a.name][key_raw] = val
+                u[container][a.name][kind] = val
+        edit_config(upd)
+        cc = db()
+        if kind == "global":
+            cc.execute("update custom_agents set skills_dir=? where key=?", (val, a.name))
+        elif kind == "project":
+            cc.execute("update custom_agents set project_dir=? where key=?", (val, a.name))
+        cc.commit()
+        cc.close()
+        say(f"[agent] {a.name} {key_raw} -> {val}")
+    c.close()
 
 
 # ---------------------------------------------------------------------------------------------------- mcp
@@ -4789,10 +4925,14 @@ def main(argv=None):
     p.add_argument("--all", action="store_true", help="also gate, write the prompt hook and install the timers")
     p.set_defaults(f=cmd_join)
     sp.add_parser("peers", help="every machine on the bank and whether this one is in step").set_defaults(f=cmd_peers)
-    p = sp.add_parser("agents", help="known harnesses: list | add NAME [--dir] | remove NAME | ignore NAME")
-    p.add_argument("action", nargs="?", choices=["list", "add", "remove", "ignore"])
+    p = sp.add_parser("agents", help="known harnesses: list | add NAME [--dir] [--project] | remove NAME | ignore NAME | path NAME KEY VALUE")
+    p.add_argument("action", nargs="?", choices=["list", "add", "remove", "ignore", "path"])
     p.add_argument("name", nargs="?")
+    p.add_argument("key", nargs="?")
+    p.add_argument("value", nargs="?")
     p.add_argument("--dir")
+    p.add_argument("--project")
+    p.add_argument("--name", dest="agent_name", help="display name for a custom agent")
     p.add_argument("--no-project", action="store_true", help="do not add its project folder to project_dirs")
     p.add_argument("--all", action="store_true", help="list known harnesses that are not on this machine too")
     p.set_defaults(f=cmd_agents)
