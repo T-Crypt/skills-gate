@@ -580,7 +580,13 @@ def toks(text: str) -> list[str]:
     return [stem(w) for w in WORD.findall((text or "").lower()) if len(w) > 1 and w not in STOP]
 
 
-FIELDS = (("name", 3.0), ("description", 1.0), ("lane", 0.5), ("keywords", 0.4))
+
+def skill_rows(c):
+    return c.execute("select s.*, coalesce((select group_concat(tag, ' ') from skill_tags where skill=s.name), '') as tags "
+                     "from skills s order by s.name").fetchall()
+
+
+FIELDS = (("name", 3.0), ("description", 1.0), ("lane", 0.5), ("keywords", 0.4), ("tags", 5.0))
 
 
 class Index:
@@ -1627,7 +1633,7 @@ def cmd_search(a):
     c = db()
     cfg = config()
     if not a.market:
-        hits = Index(c.execute("select * from skills").fetchall()).rank(a.query, a.limit)
+        hits = Index(skill_rows(c)).rank(a.query, a.limit)
         if a.json:
             say(json.dumps([{"name": r["name"], "lane": r["lane"], "score": s, "description": r["description"],
                              "tokens": r["tokens"], "uses": r["uses"], "risk": r["risk"]} for s, r in hits], indent=1))
@@ -1673,7 +1679,7 @@ def cmd_suggest(a):
         die('suggest needs the task: skills-gate suggest "<what you are about to do>"')
     c = db()
     cfg = config()
-    hits_rows = c.execute("select * from skills").fetchall()
+    hits_rows = skill_rows(c)
     hits = Index(hits_rows).rank(a.task, 10)
     picks = hits[: a.limit] if a.all else confident(hits, cfg, n_docs=len(hits_rows))[: a.limit]
     if a.json:
@@ -1697,7 +1703,7 @@ def hook_suggest():
     scope = str(project_root(Path(payload["cwd"]))) if payload.get("cwd") else None
     for r in c.execute("select skill from toggles where scope in ('global', ?)", (scope or "",)):
         exclude.add(r[0])
-    rows = c.execute("select * from skills").fetchall()
+    rows = skill_rows(c)
     picks = confident(Index(rows).rank(prompt[:4000], 10), cfg, exclude, n_docs=len(rows))
     if not picks:
         return
@@ -2192,7 +2198,7 @@ def catalog_search(c, query: str, limit: int, show_all: bool = False) -> list[di
     catalog_tables(c)
     statuses = ("ok", "warn", "fail") if show_all else ("ok", "warn")
     rows = c.execute(f"select * from market where status in ({','.join('?' * len(statuses))})", statuses).fetchall()
-    docs = [{"name": r["name"] or r["skill"], "description": r["description"], "lane": r["repo"], "keywords": "",
+    docs = [{"name": r["name"] or r["skill"], "description": r["description"], "lane": r["repo"], "keywords": "", "tags": "",
              "uses": 0, "_row": r} for r in rows]
     names = {x[0] for x in c.execute("select name from skills")}
     out = []
@@ -2240,8 +2246,9 @@ def cmd_show(a):
     toggles = c.execute("select scope, on_at from toggles where skill=?", (r["name"],)).fetchall()
     refs = [x[0] for x in c.execute("select path from refs where skill=? order by path", (r["name"],))]
     presets = [x[0] for x in c.execute("select name from presets where skill=?", (r["name"],))]
+    tags = [x[0] for x in c.execute("select tag from skill_tags where skill=? order by rowid", (r["name"],))]
     info = dict(r) | {"path": str(bank_path(r["name"])), "on": [t["scope"] for t in toggles], "referenced_by": refs,
-                      "presets": presets}
+                      "presets": presets, "tags": tags}
     info.pop("keywords", None)
     if a.json:
         say(json.dumps(info, indent=1))
@@ -2362,6 +2369,209 @@ def remove_skill(c, cfg, n):
     c.execute("delete from presets where skill=?", (n,))
     event(c, n, "remove", "moved to cold")
     say(f"[cold]  {n} -> {dst}  (restore: skills-gate add {dst})")
+
+
+# ---------------------------------------------------------------------------------------------------- tags
+
+def _split_tags(vals):
+    out = []
+    for v in vals or []:
+        for part in str(v).split(","):
+            part = part.strip()
+            if part:
+                out.append(part)
+    return out
+
+
+def _skill_tags(c, name):
+    return [r[0] for r in c.execute("select tag from skill_tags where skill=? order by rowid", (name,)).fetchall()]
+
+
+def _tags_of(c):
+    return {r[0]: [x[0] for x in c.execute("select tag from skill_tags where skill=? order by rowid", (r[0],)).fetchall()]
+            for r in c.execute("select name from skills").fetchall()}
+
+
+def _presets_of_skill(c):
+    out = {}
+    for skill, preset in c.execute("select skill, name from presets").fetchall():
+        out.setdefault(skill, []).append(preset)
+    return out
+
+
+def _cleanup_tags(c):
+    c.execute("delete from tags where name not in (select distinct tag from skill_tags)")
+
+
+def cmd_tag(a):
+    c = db()
+    action = a.action
+    dry = bool(getattr(a, "dry_run", False))
+    j = bool(getattr(a, "json", False))
+
+    if action == "list":
+        ref = getattr(a, "reference", None)
+        if ref is not None:
+            r = get(c, ref)
+            tags = _skill_tags(c, r["name"])
+            obj = {"skill_id": r["name"], "skill": r["name"], "name": r["name"], "tags": tags}
+            if j:
+                say(json.dumps(obj, indent=1))
+            else:
+                say(f"{r['name']}: {', '.join(tags) if tags else '(none)'}")
+            return
+        tags = [r[0] for r in c.execute("select name from tags order by name").fetchall()]
+        if j:
+            say(json.dumps(tags, indent=1))
+        else:
+            for t in tags:
+                say(t)
+        return
+
+    if action == "rename":
+        old = a.old_name
+        new = a.new_name
+        affected = c.execute("select count(distinct skill) from skill_tags where tag=?", (old,)).fetchone()[0]
+        if not dry:
+            # merge into an existing tag if needed
+            c.execute("insert or ignore into tags (name, color, created_at) values (?,?,?)",
+                      (new, "", now()))
+            rows = c.execute("select skill from skill_tags where tag=?", (old,)).fetchall()
+            for (sk,) in rows:
+                c.execute("insert or ignore into skill_tags values (?,?)", (sk, new))
+                c.execute("delete from skill_tags where skill=? and tag=?", (sk, old))
+            c.execute("delete from tags where name=?", (old,))
+            _cleanup_tags(c)
+            c.commit()
+        obj = {"ok": True, "tag": old, "renamed_to": new, "affected_skills": affected,
+               "dry_run": dry, "deleted": False}
+        if j:
+            say(json.dumps(obj, indent=1))
+        else:
+            say(f"[tag] renamed {old} -> {new} ({affected} skill(s)){' (dry run)' if dry else ''}")
+        return
+
+    if action == "delete":
+        name = a.name
+        affected = c.execute("select count(distinct skill) from skill_tags where tag=?", (name,)).fetchone()[0]
+        if not getattr(a, "yes", False) and not dry:
+            die("refusing to delete tag without --yes")
+        if not dry:
+            c.execute("delete from skill_tags where tag=?", (name,))
+            c.execute("delete from tags where name=?", (name,))
+            _cleanup_tags(c)
+            c.commit()
+        obj = {"ok": True, "tag": name, "renamed_to": None, "affected_skills": affected,
+               "dry_run": dry, "deleted": (not dry)}
+        if j:
+            say(json.dumps(obj, indent=1))
+        else:
+            say(f"[tag] deleted {name} ({affected} skill(s)){' (dry run)' if dry else ''}")
+        return
+
+    # add / remove / set
+    skill = a.skill
+    r = get(c, skill)
+    tags = _split_tags(getattr(a, "tags", []) or [])
+    if action == "add":
+        if not dry:
+            for t in tags:
+                c.execute("insert or ignore into tags (name, color, created_at) values (?,?,?)", (t, "", now()))
+                c.execute("insert or ignore into skill_tags values (?,?)", (skill, t))
+            _cleanup_tags(c)
+            c.commit()
+    elif action == "remove":
+        if not dry:
+            for t in tags:
+                c.execute("delete from skill_tags where skill=? and tag=?", (skill, t))
+            _cleanup_tags(c)
+            c.commit()
+    elif action == "set":
+        if not dry:
+            c.execute("delete from skill_tags where skill=?", (skill,))
+            for t in tags:
+                c.execute("insert or ignore into tags (name, color, created_at) values (?,?,?)", (t, "", now()))
+                c.execute("insert or ignore into skill_tags values (?,?)", (skill, t))
+            _cleanup_tags(c)
+            c.commit()
+
+    # compute resulting tags (apply hypothetically for dry run)
+    if dry:
+        cur = set(_skill_tags(c, skill))
+        if action == "add":
+            cur |= set(tags)
+        elif action == "remove":
+            cur -= set(tags)
+        elif action == "set":
+            cur = set(tags)
+        cur_tags = [t for t in tags if t in cur] + [t for t in _skill_tags(c, skill) if t not in tags and t in cur]
+        # preserve a sensible order: existing then new
+        seen = set()
+        ordered = []
+        for t in _skill_tags(c, skill) + tags:
+            if t in cur and t not in seen:
+                seen.add(t)
+                ordered.append(t)
+        cur_tags = ordered
+    else:
+        cur_tags = _skill_tags(c, skill)
+
+    obj = {"skill_id": skill, "skill": skill, "name": r["name"], "tags": cur_tags}
+    if j:
+        say(json.dumps(obj, indent=1))
+    else:
+        say(f"[tag] {skill}: {', '.join(cur_tags) if cur_tags else '(none)'}")
+
+
+def cmd_list(a):
+    c = db()
+    tag_filter = _split_tags(getattr(a, "tag", None) or [])
+    tag_filter = tag_filter  # list
+    q = (getattr(a, "query", None) or "").strip().lower()
+    preset_filter = getattr(a, "preset", None) or []
+    tag_map = _tags_of(c)
+    preset_map = _presets_of_skill(c)
+    rows = c.execute("select * from skills order by name").fetchall()
+    out = []
+    for r in rows:
+        name = r["name"]
+        stags = tag_map.get(name, [])
+        spresets = preset_map.get(name, [])
+        if tag_filter and not (set(stags) & set(tag_filter)):
+            continue
+        if getattr(a, "untagged", False) and stags:
+            continue
+        if getattr(a, "no_preset", False) and spresets:
+            continue
+        if preset_filter and not (set(spresets) & set(preset_filter)):
+            continue
+        if q and q not in name.lower() and q not in (r["description"] or "").lower():
+            continue
+        out.append({
+            "id": name,
+            "name": name,
+            "lane": r["lane"],
+            "description": r["description"],
+            "path": str(bank_path(name)),
+            "enabled": True,
+            "tags": stags,
+            "source": r["source"],
+            "source_type": "git" if (r["source"] or "").startswith(("http", "git@")) else "local",
+            "source_ref": r["source"],
+            "presets": spresets,
+            "preset_ids": [],
+            "uses": r["uses"],
+            "pinned": bool(r["pinned"]),
+        })
+    limit = getattr(a, "limit", None)
+    if limit:
+        out = out[:limit]
+    if getattr(a, "json", False):
+        say(json.dumps(out, indent=1))
+        return
+    for item in out:
+        tags = ", ".join(item["tags"]) if item["tags"] else "-"
+        say(f"{item['name']:<34} [{item['lane']}] tags={tags}")
 
 
 # ---------------------------------------------------------------------------------------------------- presets
@@ -2835,7 +3045,7 @@ def cmd_bench(a):
     """recall@1, recall@k and MRR of the ranker on a JSONL file of {"prompt": ..., "expect": name | [names]}."""
     c = db()
     cfg = config()
-    rows = c.execute("select * from skills").fetchall()
+    rows = skill_rows(c)
     idx = Index(rows)
     cases = [json.loads(ln) for ln in Path(a.file).read_text().splitlines() if ln.strip()]
     r1 = rk = mrr = fired = right = 0
@@ -4431,6 +4641,77 @@ def main(argv=None):
     p.add_argument("name", nargs="?")
     p.add_argument("skills", nargs="*")
     p.set_defaults(f=cmd_preset)
+    # ---- tags
+    p = sp.add_parser("tag", aliases=["tags"], help="tags on bank skills: add | remove | set | rename | delete | list")
+    tsub = p.add_subparsers(dest="action", required=True)
+    for act in ("add", "remove", "set"):
+        tp = tsub.add_parser(act, help=f"{act} tags on a skill")
+        tp.add_argument("skill")
+        tp.add_argument("tags", nargs="*")
+        tp.add_argument("--dry-run", action="store_true")
+        tp.add_argument("--json", action="store_true")
+        tp.set_defaults(f=cmd_tag, action=act)
+    tp = tsub.add_parser("rename", help="rename a tag everywhere")
+    tp.add_argument("old_name")
+    tp.add_argument("new_name")
+    tp.add_argument("--dry-run", action="store_true")
+    tp.add_argument("--json", action="store_true")
+    tp.set_defaults(f=cmd_tag, action="rename")
+    tp = tsub.add_parser("delete", help="delete a tag everywhere")
+    tp.add_argument("name")
+    tp.add_argument("--yes", action="store_true")
+    tp.add_argument("--dry-run", action="store_true")
+    tp.add_argument("--json", action="store_true")
+    tp.set_defaults(f=cmd_tag, action="delete")
+    tp = tsub.add_parser("list", help="list tags, or the tags on one skill")
+    tp.add_argument("reference", nargs="?")
+    tp.add_argument("--json", action="store_true")
+    tp.set_defaults(f=cmd_tag, action="list")
+
+    def _add_list_parser(parser):
+        parser.add_argument("query", nargs="?")
+        parser.add_argument("--tag", action="append", default=None, help="filter by tag (repeat or comma-separate)")
+        parser.add_argument("--untagged", action="store_true", help="only skills with no tags")
+        parser.add_argument("--no-preset", action="store_true", help="only skills in no preset")
+        parser.add_argument("--preset", action="append", default=None, help="filter by preset")
+        parser.add_argument("--limit", type=int, default=None)
+        parser.add_argument("--json", action="store_true")
+
+    p = sp.add_parser("list", help="list banked skills (--tag, --untagged, --no-preset, ...)")
+    _add_list_parser(p)
+    p.set_defaults(f=cmd_list)
+
+    p = sp.add_parser("skills", help="banked skills: list | tag ...")
+    ssub = p.add_subparsers(dest="skills_action", required=True)
+    pl = ssub.add_parser("list", help="list banked skills")
+    _add_list_parser(pl)
+    pl.set_defaults(f=cmd_list)
+    pt = ssub.add_parser("tag", aliases=["tags"], help="tags on bank skills")
+    tsub2 = pt.add_subparsers(dest="action", required=True)
+    for act in ("add", "remove", "set"):
+        tp = tsub2.add_parser(act, help=f"{act} tags on a skill")
+        tp.add_argument("skill")
+        tp.add_argument("tags", nargs="*")
+        tp.add_argument("--dry-run", action="store_true")
+        tp.add_argument("--json", action="store_true")
+        tp.set_defaults(f=cmd_tag, action=act)
+    tp = tsub2.add_parser("rename", help="rename a tag everywhere")
+    tp.add_argument("old_name")
+    tp.add_argument("new_name")
+    tp.add_argument("--dry-run", action="store_true")
+    tp.add_argument("--json", action="store_true")
+    tp.set_defaults(f=cmd_tag, action="rename")
+    tp = tsub2.add_parser("delete", help="delete a tag everywhere")
+    tp.add_argument("name")
+    tp.add_argument("--yes", action="store_true")
+    tp.add_argument("--dry-run", action="store_true")
+    tp.add_argument("--json", action="store_true")
+    tp.set_defaults(f=cmd_tag, action="delete")
+    tp = tsub2.add_parser("list", help="list tags, or the tags on one skill")
+    tp.add_argument("reference", nargs="?")
+    tp.add_argument("--json", action="store_true")
+    tp.set_defaults(f=cmd_tag, action="list")
+
     p = sp.add_parser("project", help=f"the project's {MANIFEST}: show | save (from what is on) | sync (install + on)")
     p.add_argument("action", choices=["show", "save", "sync"])
     p.add_argument("--project")
