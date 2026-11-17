@@ -242,7 +242,8 @@ def confirm(question: str, yes: bool) -> bool:
 
 SKILL_COLS = {"keywords": "text not null default ''", "orig_hash": "text not null default ''",
               "ref": "text not null default ''", "risk": "text not null default ''",
-              "up_tree": "text not null default ''"}  # git tree id of the upstream folder the bank copy came from
+              "up_tree": "text not null default ''",  # git tree id of the upstream folder the bank copy came from
+              "token_estimate": "integer not null default 0"}
 
 
 def db(timeout: float = 15) -> sqlite3.Connection:
@@ -280,6 +281,7 @@ def db(timeout: float = 15) -> sqlite3.Connection:
     for col, decl in SKILL_COLS.items():
         if col not in have:
             c.execute(f"alter table skills add column {col} {decl}")
+    migrate(c)
     if meta_get(c, "schema") != "2":
         migrate_v2(c)
     return c
@@ -294,6 +296,71 @@ def migrate_v2(c):
             c.execute("update skills set hash=?, orig_hash=?, keywords=? where name=?",
                       (h, h, body_keywords(p / "SKILL.md"), r["name"]))
     meta_set(c, "schema", "2")
+    c.commit()
+
+
+def migrate(c):
+    """Idempotent, additive migration: create the Phase 1/2 tables and add token_estimate if missing."""
+    c.executescript("""
+    create table if not exists tags (
+        name text primary key,
+        color text not null default '',
+        created_at integer not null default 0);
+    create table if not exists skill_tags (
+        skill text not null,
+        tag text not null,
+        primary key (skill, tag),
+        foreign key (skill) references skills(name) on delete cascade,
+        foreign key (tag) references tags(name) on delete cascade);
+    create index if not exists skill_tags_tag on skill_tags(tag);
+    create table if not exists workspaces (
+        id text primary key,
+        name text not null default '',
+        kind text not null default 'project',
+        path text not null,
+        agent text,
+        created_at integer not null default 0);
+    create unique index if not exists workspaces_path on workspaces(path);
+    create table if not exists deployments (
+        skill text not null,
+        agent text not null,
+        path text not null default '',
+        mode text not null default 'symlink',
+        state text not null default 'live',
+        created_at integer not null default 0,
+        updated_at integer,
+        primary key (skill, agent));
+    create table if not exists custom_agents (
+        key text primary key,
+        name text not null default '',
+        skills_dir text not null default '',
+        project_dir text,
+        enabled integer not null default 1,
+        created_at integer not null default 0);
+    create table if not exists activity_log (
+        id integer primary key autoincrement,
+        at integer not null,
+        kind text not null,
+        skill text,
+        agent text,
+        workspace text,
+        detail text not null default '',
+        result text not null default '');
+    create index if not exists activity_log_at on activity_log(at);
+    create table if not exists context_usage (
+        id integer primary key autoincrement,
+        session_id text,
+        harness text,
+        skill text,
+        tokens integer not null default 0,
+        at integer not null);
+    create index if not exists context_usage_at on context_usage(at);
+    """)
+    have = {r[1] for r in c.execute("pragma table_info(skills)")}
+    if "token_estimate" not in have:
+        c.execute("alter table skills add column token_estimate integer not null default 0")
+    c.execute("update skills set token_estimate = tokens "
+              "where coalesce(token_estimate, 0) = 0 and coalesce(tokens, 0) > 0")
     c.commit()
 
 
@@ -2844,6 +2911,14 @@ def cmd_doctor(a):
     raise SystemExit(1 if bad else 0)
 
 
+def cmd_migrate(a):
+    c = db()
+    tables = {r[0] for r in c.execute(
+        "select name from sqlite_master where type='table'").fetchall()}
+    say("migrated: " + ", ".join(sorted(t for t in tables if t in
+        {"tags", "skill_tags", "workspaces", "deployments", "custom_agents", "activity_log", "context_usage"})))
+
+
 def cmd_timer(a):
     """Install the daily tidy as a systemd user timer (Linux), or print a cron line elsewhere."""
     exe = Path(sys.argv[0]).resolve()
@@ -4452,6 +4527,7 @@ def main(argv=None):
     sp.add_parser("mcp", help="serve search/suggest/use over MCP (stdio)").set_defaults(f=cmd_mcp)
     sp.add_parser("status", help="what is on, where, and what it costs").set_defaults(f=cmd_status)
     sp.add_parser("doctor", help="check the gate links and the bank").set_defaults(f=cmd_doctor)
+    sp.add_parser("migrate", help="run the idempotent schema migration").set_defaults(f=cmd_migrate)
     sp.add_parser("timer", help="install the daily tidy (systemd user timer or a cron line)").set_defaults(f=cmd_timer)
     a = ap.parse_args(argv)
     a.f(a)
