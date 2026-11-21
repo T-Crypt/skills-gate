@@ -1424,6 +1424,16 @@ def cmd_init(a):
     c = db()
     write_registry(c, cfg)
     install_gate(cfg)
+    # Auto-register each agent's global skills folder as a global workspace.
+    for name, pp in (cfg.get("harness_dirs") or {}).items():
+        if not pp:
+            continue
+        path = Path(pp).expanduser()
+        if not path.is_dir():
+            continue
+        pstr = str(path)
+        c.execute("insert or ignore into workspaces (id, name, kind, path, agent, created_at) values (?,?,?,?,?,?)",
+                  (pstr, name, "global", pstr, name, now()))
     c.commit()
     found = harness_dirs(cfg)
     say(f"skills-gate {VERSION} ready at {HOME}")
@@ -4380,6 +4390,106 @@ def cmd_peers(a):
         say(f"in step: this bank matches the remote ({len(here)} skills)")
 
 
+# ---------------------------------------------------------------------------------------------------- workspaces
+
+def _find_workspace(c, ident):
+    if ident is None:
+        die("workspace needs an id or path")
+    raw = str(ident)
+    row = c.execute("select * from workspaces where id=? or path=? or name=?", (raw, raw, raw)).fetchone()
+    if row is None:
+        exp = str(Path(raw).expanduser())
+        if exp != raw:
+            row = c.execute("select * from workspaces where path=? or id=?", (exp, exp)).fetchone()
+    if row is None:
+        die(f"no workspace {ident!r}")
+    return row
+
+
+def cmd_workspace(a):
+    c = db()
+    action = getattr(a, "action", None) or "list"
+    dry = bool(getattr(a, "dry_run", False))
+    j = bool(getattr(a, "json", False))
+
+    if action == "list":
+        rows = c.execute("select * from workspaces order by kind, path").fetchall()
+        out = [{"id": r["id"], "name": r["name"], "kind": r["kind"], "path": r["path"],
+                "agent": r["agent"], "created_at": r["created_at"]} for r in rows]
+        if j:
+            say(json.dumps(out, indent=1))
+        else:
+            if not out:
+                say("(no workspaces)")
+            for r in out:
+                say(f"{r['id']:<40} {r['kind']:<8} {r['agent'] or '-':<10}  {r['path']}")
+        c.close()
+        return
+
+    if action == "show":
+        ident = getattr(a, "path", None)
+        if not ident:
+            die("workspace show needs an id or path")
+        r = _find_workspace(c, ident)
+        obj = {"id": r["id"], "name": r["name"], "kind": r["kind"], "path": r["path"],
+               "agent": r["agent"], "created_at": r["created_at"]}
+        if j:
+            say(json.dumps(obj, indent=1))
+        else:
+            for k in ("id", "name", "kind", "path", "agent", "created_at"):
+                say(f"{k:<12} {obj[k]}")
+        c.close()
+        return
+
+    if action == "add":
+        raw = getattr(a, "path", None)
+        if not raw:
+            die("workspace add needs a path")
+        p = Path(raw).expanduser()
+        path_str = str(p)
+        kind = getattr(a, "kind", None) or "linked"
+        if kind not in ("global", "project", "linked"):
+            die(f"unknown kind {kind!r}")
+        agent = getattr(a, "agent", None)
+        name = getattr(a, "name", None) or (agent if agent else (p.name or path_str))
+        existing = c.execute("select * from workspaces where path=?", (path_str,)).fetchone()
+        if not dry:
+            c.execute("delete from workspaces where path=?", (path_str,))
+            c.execute("insert into workspaces (id, name, kind, path, agent, created_at) values (?,?,?,?,?,?)",
+                      (path_str, name, kind, path_str, agent, now()))
+            c.commit()
+        obj = {"ok": True, "id": path_str, "name": name, "kind": kind, "path": path_str,
+               "agent": agent, "created_at": (existing["created_at"] if existing else now()),
+               "dry_run": dry, "existed": bool(existing)}
+        if j:
+            say(json.dumps(obj, indent=1))
+        else:
+            verb = "would register" if dry else ("updated" if existing else "registered")
+            say(f"[workspace] {verb} {path_str} ({kind})")
+        c.close()
+        return
+
+    if action == "remove":
+        ident = getattr(a, "path", None)
+        if not ident:
+            die("workspace remove needs an id or path")
+        r = _find_workspace(c, ident)
+        if not dry:
+            c.execute("delete from workspaces where id=?", (r["id"],))
+            c.commit()
+        obj = {"ok": True, "id": r["id"], "name": r["name"], "kind": r["kind"], "path": r["path"],
+               "agent": r["agent"], "removed": (not dry), "dry_run": dry}
+        if j:
+            say(json.dumps(obj, indent=1))
+        else:
+            verb = "would remove" if dry else "removed"
+            say(f"[workspace] {verb} {r['path']}")
+        c.close()
+        return
+
+    die(f"unknown workspace action {action!r}")
+
+
 # ---------------------------------------------------------------------------------------------------- agents
 
 def _custom_agents_map(c):
@@ -4936,6 +5046,16 @@ def main(argv=None):
     p.add_argument("--no-project", action="store_true", help="do not add its project folder to project_dirs")
     p.add_argument("--all", action="store_true", help="list known harnesses that are not on this machine too")
     p.set_defaults(f=cmd_agents)
+    p = sp.add_parser("workspace", aliases=["workspaces"], help="skills roots: add | list | remove | show")
+    p.add_argument("action", nargs="?", choices=["add", "list", "remove", "show"], default="list")
+    p.add_argument("path", nargs="?")
+    p.add_argument("--kind", choices=["global", "project", "linked"], default="linked")
+    p.add_argument("--agent")
+    p.add_argument("--name")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(f=cmd_workspace)
     p = sp.add_parser("stats", help="usage by harness, top skills, cold candidates, suggestion hit rate")
     p.add_argument("--days", type=int, default=30)
     p.add_argument("--limit", type=int, default=10)
