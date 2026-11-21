@@ -148,9 +148,14 @@ export default function createSkillsGate(host: Host = {}) {
                 return undefined; // counted before a restart
             }
 
-            await api.memo<number>("skills-gate.seen", Date.now(), context);
             const cwd = localCwd(host, String(api.conversationId));
-            const path = isAbsolute(args.path) || cwd === undefined ? args.path : resolve(cwd, args.path);
+
+            if (cwd === undefined) {
+                return undefined; // a remote workspace: its paths name files on another machine
+            }
+
+            await api.memo<number>("skills-gate.seen", Date.now(), context);
+            const path = isAbsolute(args.path) ? args.path : resolve(cwd, args.path);
 
             void run(["seen", path, "--via", "hadal"], undefined, SUGGEST_MS);
 
