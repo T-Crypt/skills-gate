@@ -101,6 +101,18 @@ class GateTest(Base):
         self.assertIn("Do the thing.", out)
         self.assertIn('"uses": 1', self.sg("show", "video-cut", "--json").stdout)
 
+    def test_seen_counts_reported_loads_and_ignores_the_rest(self):
+        self.sg("gate")
+        out = self.sg("seen", "--via", "hadal", "--json",
+                      str(self.home / ".pi" / "agent" / "skills" / "video-cut" / "SKILL.md"),
+                      str(self.project / ".agents" / "skills" / "not-banked" / "SKILL.md"),
+                      str(self.home / "notes" / "video-cut.md")).stdout
+        self.assertEqual(json.loads(out), {"ok": True, "counted": ["video-cut"]})
+        self.assertIn('"uses": 1', self.sg("show", "video-cut", "--json").stdout)
+        rows = self.db().execute("select detail from events where skill='video-cut' and kind='seen'").fetchall()
+        self.assertEqual(rows, [("hadal",)])
+        self.assertNotEqual(self.sg("seen", "--via", "../x", "video-cut", ok=False).returncode, 0)
+
     def test_on_off_project_and_tidy_prunes_stale(self):
         self.sg("gate")
         self.sg("on", "code-review", cwd=self.project)
