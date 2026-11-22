@@ -80,6 +80,13 @@ skills-gate: banked skills that match this request. If one fits, load it with
 Harnesses without hooks still see the gate skill. Its body lists every lane and every skill name,
 so an agent can choose without a second call. Harnesses without a shell can use `skills-gate mcp`.
 
+**HADAL.** HADAL has no prompt hook to write, and it keeps its sessions in its own database, where `tidy`
+cannot count loads. The drop-in `harness/hadal/skills-gate.ts` does both jobs. Before each request it
+adds the `suggest --hook` note to the newest message, for that request only. After each `read` of a
+`SKILL.md` it runs `skills-gate seen <path> --via hadal`. Copy it into `~/.hadal/extensions/` and turn
+it on in Menu → Extensions. `node --test harness/hadal/skills-gate.test.ts` runs it in a throwaway
+HADAL (`HADAL_SRC` points at the checkout).
+
 ## What it does
 
 **Finds the right skill**
@@ -285,6 +292,7 @@ more than seeing every skill at once. They can share a machine:
 | `suggest "<task>" [--all] [--json]` | The banked skills that fit, ranked; `--hook` for prompt hooks |
 | `hook [--write \| --remove]` | Print, install or remove the Claude Code prompt hook |
 | `use <skill>` | Print a skill's playbook into the session |
+| `seen <paths or names> --via <harness>` | Count loads a harness reports itself (the HADAL drop-in calls it) |
 | `on` / `off <skills> [--lane L] [--preset P] [--global] [--save]` | Link skills into a project or every harness |
 | `search <words> [--market] [--live] [--offline]` | Search the bank, the validated catalog, or the marketplaces live |
 | `market [refresh \| new \| show \| validate \| stats]` | The marketplace catalog: gather, validate, browse |

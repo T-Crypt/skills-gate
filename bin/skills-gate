@@ -2167,6 +2167,26 @@ def cmd_use(a):
         say(f"\n<!-- files in {p}: {', '.join(extra[:40])}{' ...' if len(extra) > 40 else ''} -->")
 
 
+def cmd_seen(a):
+    """Count loads a harness reports itself: HADAL keeps its sessions in a database `tidy` cannot read, so its
+    drop-in passes each SKILL.md path it saw read. Paths and names that are not bank skills are ignored."""
+    if not NAME_RX.match(a.via):
+        die(f"--via {a.via!r} is not a harness name")
+    c = db(timeout=2)  # called from a hook: a tidy holding the lock must not stall the session
+    names = {r[0] for r in c.execute("select name from skills")}
+    counted = []
+    for arg in a.paths:
+        found = {m.group(1) for m in SKILL_PATH.finditer(arg)} or ({arg} if NAME_RX.match(arg) else set())
+        for s in sorted(found & names):
+            touch(c, s, "seen", detail=a.via)
+            counted.append(s)
+    c.commit()
+    if a.json:
+        say(json.dumps({"ok": True, "counted": counted}))
+    elif counted:
+        say("seen: " + ", ".join(counted))
+
+
 def cmd_show(a):
     c = db()
     r = get(c, a.skill)
@@ -4337,6 +4357,11 @@ def main(argv=None):
     p = sp.add_parser("use", help="print a skill's playbook into the session (on demand)")
     p.add_argument("skill")
     p.set_defaults(f=cmd_use)
+    p = sp.add_parser("seen", help="count skill loads a harness reports itself (SKILL.md paths or names)")
+    p.add_argument("paths", nargs="+")
+    p.add_argument("--via", required=True, help="the harness that saw the load, e.g. hadal")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_seen)
     p = sp.add_parser("show", help="registry entry for a skill")
     p.add_argument("skill")
     p.add_argument("--json", action="store_true")
