@@ -64,6 +64,10 @@ DEFAULT_CONFIG = {
     "project_dirs": [".agents/skills", ".claude/skills"],
     # Skills that stay visible everywhere. The gate itself is always on.
     "always_on": [],
+    # A skill banked from a git repo is suggested only inside that repo. Sources under these folders (and the
+    # harness_dirs) stay global even when they sit in a repo.
+    "global_sources": ["~/.agents", "~/.claude", "~/.codex", "~/.config", "~/.pi", "~/.skills-manager",
+                       "~/homelab/harnesses"],
     # A skill switched on but unused this many days is switched off.
     "prune_days": 14,
     # A bank skill unused this many days (not pinned, not referenced) moves to cold storage.
@@ -242,7 +246,8 @@ def confirm(question: str, yes: bool) -> bool:
 
 SKILL_COLS = {"keywords": "text not null default ''", "orig_hash": "text not null default ''",
               "ref": "text not null default ''", "risk": "text not null default ''",
-              "up_tree": "text not null default ''"}  # git tree id of the upstream folder the bank copy came from
+              "up_tree": "text not null default ''",  # git tree id of the upstream folder the bank copy came from
+              "scope": "text not null default ''"}  # project folder the skill is suggested in; '' = everywhere
 
 
 def db(timeout: float = 15) -> sqlite3.Connection:
@@ -460,10 +465,12 @@ def register(c, src: Path, lane: str | None = None, link: bool = False, source: 
     else:
         shutil.copytree(src, dst, symlinks=False, ignore=IGNORE)
     desc = fm.get("description", "")
-    row = c.execute("select lane, pinned, added_at, last_used, uses from skills where name=?", (name,)).fetchone()
+    row = c.execute("select lane, pinned, added_at, last_used, uses, scope from skills where name=?",
+                    (name,)).fetchone()
     meta = meta or {}
     lane = lane or meta.get("lane") or (row["lane"] if row else None) or guess_lane(name, desc)
     pinned = meta.get("pinned", row["pinned"] if row else 0)
+    scope = row["scope"] if row else skill_scope(source or str(src), config())
     h = tree_hash(dst)
     risk = scan_level(scan_tree(dst))
     c.execute("insert or replace into skills (name, lane, description, source, link, hash, tokens, pinned, added_at,"
@@ -471,6 +478,7 @@ def register(c, src: Path, lane: str | None = None, link: bool = False, source: 
               (name, lane, desc, source or str(src), int(link), h, est_tokens(dst / "SKILL.md"), int(pinned),
                row["added_at"] if row else now(), row["last_used"] if row else None, row["uses"] if row else 0,
                body_keywords(dst / "SKILL.md"), h, ref, risk, "" if link else up_tree or meta.get("up_tree", "")))
+    c.execute("update skills set scope=? where name=?", (scope, name))
     event(c, name, kind, source or str(src))
     say(f"[{kind:<5}] {name}  lane={lane}{'  (linked)' if link else ''}{f'  risk={risk}' if risk else ''}")
     return name
@@ -585,6 +593,49 @@ def project_root(start: Path | None = None) -> Path:
     except (OSError, subprocess.TimeoutExpired):
         pass
     return start
+
+
+def git_toplevel(path: Path) -> Path | None:
+    try:
+        out = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"], capture_output=True,
+                             text=True, timeout=10, env=git_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return Path(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip() else None
+
+
+def is_under(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def skill_scope(source: str, cfg: dict) -> str:
+    """The project a skill belongs to: the git repo its local source sits in, or '' (global)."""
+    if not source.startswith("/"):
+        return ""  # a URL or owner/repo install: no local project
+    src = Path(source)
+    if not src.exists():
+        return ""
+    globals_ = [Path(p).expanduser() for p in cfg.get("global_sources", [])] + list(harness_dirs(cfg).values())
+    for p in (src, src.resolve()):
+        if any(is_under(p, g) or is_under(p, g.resolve()) for g in globals_):
+            return ""
+    root = git_toplevel(src if src.is_dir() else src.parent)
+    if root is None or root.resolve() == Path.home().resolve():
+        return ""
+    return str(root.resolve())
+
+
+def in_scope(scope: str, cwd: str | None) -> bool:
+    """A global skill fits everywhere; a scoped one only when cwd is inside its scope."""
+    if not scope:
+        return True
+    if not cwd:
+        return False
+    return is_under(Path(cwd).resolve(), Path(scope))
+
+
+def scoped_rows(c, cwd: str | None):
+    return [r for r in c.execute("select * from skills").fetchall() if in_scope(r["scope"], cwd)]
 
 
 def bank_target(link: Path) -> str | None:
@@ -1560,7 +1611,8 @@ def cmd_search(a):
     c = db()
     cfg = config()
     if not a.market:
-        hits = Index(c.execute("select * from skills").fetchall()).rank(a.query, a.limit)
+        rows = scoped_rows(c, a.cwd) if a.cwd else c.execute("select * from skills").fetchall()
+        hits = Index(rows).rank(a.query, a.limit)
         if a.json:
             say(json.dumps([{"name": r["name"], "lane": r["lane"], "score": s, "description": r["description"],
                              "tokens": r["tokens"], "uses": r["uses"], "risk": r["risk"]} for s, r in hits], indent=1))
@@ -1594,6 +1646,48 @@ def cmd_search(a):
             "  install with: skills-gate add <install> --yes  (only on the user's yes)")
 
 
+def cmd_scope(a):
+    """List scoped skills, set or clear one skill's scope, or derive the scope of every banked skill."""
+    c = db()
+    if a.migrate:
+        cfg = config()
+        changes = []
+        for r in c.execute("select name, source, scope from skills order by name").fetchall():
+            new = skill_scope(r["source"], cfg)
+            if new != r["scope"]:
+                changes.append((r["name"], r["scope"], new))
+        for name, old, new in changes:
+            say(f"[{'would' if a.dry_run else 'scope'}] {name:<34} {old or 'global'} -> {new or 'global'}")
+            if not a.dry_run:
+                c.execute("update skills set scope=? where name=?", (new, name))
+                event(c, name, "scope", new)
+        say(f"{len(changes)} skill(s) {'would change' if a.dry_run else 'changed'}")
+        c.commit()
+        return
+    if not a.skill:
+        rows = c.execute("select name, scope from skills where scope != '' order by scope, name").fetchall()
+        for r in rows:
+            say(f"{r['name']:<34} {r['scope']}")
+        if not rows:
+            say("every banked skill is global")
+        return
+    get(c, a.skill)
+    if a.clear:
+        new = ""
+    elif a.path:
+        p = Path(a.path).expanduser()
+        if not p.is_dir():
+            die(f"scope must be a folder: {a.path}")
+        new = str(p.resolve())
+    else:
+        say(c.execute("select scope from skills where name=?", (a.skill,)).fetchone()[0] or "global")
+        return
+    c.execute("update skills set scope=? where name=?", (new, a.skill))
+    event(c, a.skill, "scope", new)
+    c.commit()
+    say(f"[scope] {a.skill} -> {new or 'global'}")
+
+
 def cmd_suggest(a):
     """Rank the bank for a task. With --hook, read a Claude Code UserPromptSubmit payload and print context."""
     if a.hook:
@@ -1606,7 +1700,7 @@ def cmd_suggest(a):
         die('suggest needs the task: skills-gate suggest "<what you are about to do>"')
     c = db()
     cfg = config()
-    hits_rows = c.execute("select * from skills").fetchall()
+    hits_rows = scoped_rows(c, a.cwd) if a.cwd else c.execute("select * from skills").fetchall()
     hits = Index(hits_rows).rank(a.task, 10)
     picks = hits[: a.limit] if a.all else confident(hits, cfg, n_docs=len(hits_rows))[: a.limit]
     if a.json:
@@ -1630,7 +1724,7 @@ def hook_suggest():
     scope = str(project_root(Path(payload["cwd"]))) if payload.get("cwd") else None
     for r in c.execute("select skill from toggles where scope in ('global', ?)", (scope or "",)):
         exclude.add(r[0])
-    rows = c.execute("select * from skills").fetchall()
+    rows = scoped_rows(c, payload.get("cwd") or None)  # another project's skills are not offered here
     picks = confident(Index(rows).rank(prompt[:4000], 10), cfg, exclude, n_docs=len(rows))
     if not picks:
         return
@@ -4307,7 +4401,15 @@ def main(argv=None):
     p.add_argument("--all", action="store_true", help="show the top matches even below the confidence bar")
     p.add_argument("--json", action="store_true")
     p.add_argument("--hook", action="store_true", help="read a UserPromptSubmit payload on stdin; never fails")
+    p.add_argument("--cwd", help="leave out skills scoped to other projects than this folder")
     p.set_defaults(f=cmd_suggest)
+    p = sp.add_parser("scope", help="show, set (<skill> <folder>) or clear a skill's project scope; --migrate")
+    p.add_argument("skill", nargs="?")
+    p.add_argument("path", nargs="?")
+    p.add_argument("--clear", action="store_true", help="make the skill global again")
+    p.add_argument("--migrate", action="store_true", help="derive the scope of every banked skill from its source")
+    p.add_argument("--dry-run", action="store_true", help="with --migrate: print the changes, write nothing")
+    p.set_defaults(f=cmd_scope)
     p = sp.add_parser("hook", help="print, --write or --remove the Claude Code prompt hook that runs suggest")
     p.add_argument("--settings", default="~/.claude/settings.json")
     g = p.add_mutually_exclusive_group()
@@ -4322,6 +4424,7 @@ def main(argv=None):
     p.add_argument("--all", action="store_true", help="include catalog entries that failed validation")
     p.add_argument("--limit", type=int, default=8)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--cwd", help="leave out skills scoped to other projects than this folder")
     p.set_defaults(f=cmd_search)
     p = sp.add_parser("market", help="the local catalog: refresh | new | show ID | validate IDS | stats")
     p.add_argument("action", nargs="?", default="stats", choices=["refresh", "new", "show", "validate", "stats"])

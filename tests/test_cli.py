@@ -1112,6 +1112,66 @@ class NightlyUpdateTest(Base):
         self.assertFalse((self.tmp / "escape").exists())
 
 
+class ScopeTest(Base):
+    """A skill banked from a repo is suggested only inside that repo."""
+
+    def setUp(self):
+        super().setUp()
+        self.sg("gate")  # bank the harness skills
+        self.repo = self.tmp / "Enyo dir"  # a space in the path on purpose
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        skill(self.repo / "07-skills", "wall-recon", "Recon a target network and scan its hosts")
+        self.sg("add", str(self.repo / "07-skills" / "wall-recon"))
+        self.prompt = "recon the target network and scan the hosts"
+
+    def hook(self, cwd):
+        payload = {"prompt": self.prompt, "session_id": "s1"}
+        if cwd is not None:
+            payload["cwd"] = str(cwd)
+        return self.sg("suggest", "--hook", inp=json.dumps(payload)).stdout
+
+    def test_add_records_the_repo_as_scope_and_globals_stay_global(self):
+        rows = dict(self.db().execute("select name, scope from skills").fetchall())
+        self.assertEqual(rows["wall-recon"], str(self.repo.resolve()))
+        self.assertEqual(rows["code-review"], "")  # from ~/.agents/skills
+        self.assertEqual(rows["lab-ops"], "")  # not in a git repo
+
+    def test_hook_suggests_scoped_skill_only_inside_its_repo(self):
+        self.assertIn("wall-recon", self.hook(self.repo))
+        sub = self.repo / "04-data"
+        sub.mkdir()
+        self.assertIn("wall-recon", self.hook(sub))
+        self.assertNotIn("wall-recon", self.hook(self.project))
+        self.assertNotIn("wall-recon", self.hook(None))
+        sibling = self.tmp / "Enyo dir-other"  # a name prefix is not containment
+        sibling.mkdir()
+        self.assertNotIn("wall-recon", self.hook(sibling))
+
+    def test_search_and_suggest_cwd_filter(self):
+        self.assertIn("wall-recon", self.sg("search", "recon scan").stdout)  # no --cwd: the whole bank
+        self.assertNotIn("wall-recon", self.sg("search", "recon scan", "--cwd", str(self.project)).stdout)
+        self.assertIn("wall-recon", self.sg("search", "recon scan", "--cwd", str(self.repo)).stdout)
+        self.assertNotIn("wall-recon", self.sg("suggest", self.prompt, "--all", "--cwd", str(self.project)).stdout)
+
+    def test_scope_set_clear_and_migrate(self):
+        self.assertEqual(self.sg("scope").stdout.split(), ["wall-recon", *str(self.repo.resolve()).split()])
+        self.sg("scope", "wall-recon", "--clear")
+        self.assertIn("wall-recon", self.hook(self.project))
+        self.assertEqual(self.sg("scope", "wall-recon").stdout.strip(), "global")
+        self.sg("scope", "code-review", str(self.project))
+        self.assertEqual(self.sg("scope", "code-review").stdout.strip(), str(self.project.resolve()))
+        self.assertIn("must be a folder", self.sg("scope", "code-review", str(self.tmp / "nope"), ok=False).stderr)
+        dry = self.sg("scope", "--migrate", "--dry-run").stdout
+        self.assertIn(f"[would] wall-recon", dry)
+        self.assertIn(f"global -> {self.repo.resolve()}", dry)
+        self.assertIn(f"code-review", dry)
+        self.assertIn("2 skill(s) would change", dry)
+        self.assertEqual(dict(self.db().execute("select name, scope from skills").fetchall())["wall-recon"], "")
+        self.assertIn("2 skill(s) changed", self.sg("scope", "--migrate").stdout)
+        self.assertIn("0 skill(s) would change", self.sg("scope", "--migrate", "--dry-run").stdout)
+        self.assertNotIn("wall-recon", self.hook(self.project))
+
+
 if __name__ == "__main__":
     unittest.main()
 
